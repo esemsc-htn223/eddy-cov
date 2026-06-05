@@ -1,0 +1,19 @@
+[workspace]
+authors = ["esemsc-htn223 <htn223@ic.ac.uk>"]
+channels = ["conda-forge"]
+name = "eddy-cov"
+platforms = ["osx-arm64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+python = ">=3.14.5,<3.15"
+marimo = ">=0.23.9,<0.24"
+numpy = ">=2.4.6,<3"
+pandas = ">=3.0.3,<4"
+matplotlib = ">=3.10.9,<4"
+altair = ">=6.1.0,<7"
+
+[pypi-dependencies]
+fluxnet-shuttle = { git = "https://github.com/fluxnet/shuttle.git" }
