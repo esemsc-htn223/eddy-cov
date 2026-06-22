@@ -1,3 +1,7 @@
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+.vscode
+data/
+downloader/
+*.DS_Store
