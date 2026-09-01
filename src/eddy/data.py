@@ -14,13 +14,20 @@ from eddy.util import DATA_DIR, logger_data
 
 FLUX_DIR = DATA_DIR / 'flux'
 FLUXNET_DIR = FLUX_DIR / 'FLUXNET'
+TERN_DIR = FLUX_DIR / 'TERN'
+AMERIFLUX_DIR = FLUX_DIR / 'AmeriFlux'
 
-if not FLUXNET_DIR.exists():
-    os.makedirs(FLUXNET_DIR)
+_dirs = [FLUX_DIR, FLUXNET_DIR, TERN_DIR, AMERIFLUX_DIR]
+for _dir in _dirs:
+    if not _dir.exists():
+        os.makedirs(_dir)
 
+# TODO: download Natural Earth data if not present
+def load_natural_earth_countries():
+    return gpd.read_file(DATA_DIR / 'NaturalEarth' / 'ne_10m_admin_0_map_subunits')
+def load_natural_earth_states():
+    return gpd.read_file(DATA_DIR / 'NaturalEarth' / 'ne_10m_admin_1_states_provinces')
 
-GDF_COUNTRIES = gpd.read_file(DATA_DIR / 'NaturalEarth' / 'ne_10m_admin_0_map_subunits')
-GDF_STATES = gpd.read_file(DATA_DIR / 'NaturalEarth' / 'ne_10m_admin_1_states_provinces')
 
 
 def _get_latest_fluxnet_snapshot_path():
@@ -63,7 +70,6 @@ async def load_fluxnet_snapshot(*, return_type: Literal['gdf', 'df', 'path'] = '
             snapshot_filepath = _get_latest_fluxnet_snapshot_path()
             logger_data.info(f'LOADED FLUXNET SNAPSHOT - loaded latest file with fname="{snapshot_filepath}" from disk')
         except FileNotFoundError as e:
-            raise e
             print(f'No local snapshot file found, downloading from FLUXNET.')
             logger_data.info('DOWNLOADING FLUXNET SNAPSHOT - no local file found')
             snapshot_filepath = await shuttle.listall(output_dir = FLUXNET_DIR)
