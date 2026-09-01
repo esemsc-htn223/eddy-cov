@@ -210,12 +210,6 @@ def _(gdf_ameriflux_badm, gpd, pd):
 
 
 @app.cell
-def _(gdf_fluxnet):
-    gdf_fluxnet
-    return
-
-
-@app.cell
 def _(GDF_COUNTRIES, gdf_ameriflux, plt):
     _fig, _ax = plt.subplots(figsize = (10,20))
     GDF_COUNTRIES.plot(ax=_ax, facecolor = 'None', linewidth = 0.5)
