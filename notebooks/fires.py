@@ -22,16 +22,43 @@ def _(mo):
 
 @app.cell
 def _():
-    import eddy.data as d
+    import pandas as pd
+    import geopandas as gpd
+    import numpy as np
 
-    d.DATA_DIR
-    return
+    import matplotlib.pyplot as plt
+    import matplotlib as mpl
+    import marimo as mo
+
+    from dataclasses import dataclass
+    from typing import Literal
+
+    return Literal, dataclass, gpd, mo, np, pd, plt
+
+
+@app.cell
+async def _():
+    import eddy
+    from eddy.data import DATA_DIR, FLUXNET_DIR, TERN_DIR
+    GDF_COUNTRIES = eddy.data.load_natural_earth_countries()
+    GDF_STATES = eddy.data.load_natural_earth_states()
+
+    #_uk_bbox = (-7.57216793459, 49.959999905, 1.68153079591, 58.6350001085)
+    UK_BBOX = {
+        'min_lon': -10.0,
+        'max_lon': 2.0,
+        'min_lat': 49.0,
+        'max_lat': 61.0
+    }
+
+    gdf_fluxnet = await eddy.data.load_fluxnet_snapshot()
+    return DATA_DIR, FLUXNET_DIR, GDF_COUNTRIES, TERN_DIR, UK_BBOX, gdf_fluxnet
 
 
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    ## Fires
+    ## Quantifying relevance of EC to carbon offsetting
     """)
     return
 
@@ -39,22 +66,173 @@ def _(mo):
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    - Data assimilation with current fire-spread algorithms:
-        Fire-EnSF/WRF-SFIRE/FARSITE
+    1. Where are carbon offset projects?
+    2. Where are EC towers?
+    3. Do these overlap?
     """)
     return
 
 
 @app.cell
-def _(gdf_fluxnet):
-    gdf_fluxnet.loc[gdf_fluxnet['site_name'].str.contains('warra', case = False)]
+def _(DATA_DIR, GDF_COUNTRIES, UK_BBOX, gpd, plt):
+    gdf_offset_uk = gpd.read_file(DATA_DIR / 'offsets/Woodland_Carbon_Code_Projects_Read_Only_View_7714146472369880997.geojson')
+
+    _fig, _ax = plt.subplots(figsize=(10, 10))
+    gdf_offset_uk.plot(facecolor='green', ax = _ax)
+    GDF_COUNTRIES.plot(ax=_ax, linewidth=0.25, facecolor='None')
+    _ax.set_axis_off()
+    _ax.set_xlim(UK_BBOX['min_lon'], UK_BBOX['max_lon'])
+    _ax.set_ylim(UK_BBOX['min_lat'], UK_BBOX['max_lat'])
+    _ax
+    return (gdf_offset_uk,)
+
+
+@app.cell
+def _(GDF_COUNTRIES, UK_BBOX, gdf_fluxnet, gdf_offset_uk, plt):
+
+    _fig, _ax = plt.subplots(figsize=(10, 10))
+    gdf_fluxnet.loc[gdf_fluxnet['site_id'].str.startswith('UK-')].plot(
+        marker='x', color='red', markersize=10, alpha=0.7, ax=_ax
+    )
+    GDF_COUNTRIES.plot(ax=_ax, linewidth=0.25, facecolor='None')
+    gdf_offset_uk.plot(ax=_ax, alpha = 0.7, facecolor = 'green')
+    _ax.set_xlim(UK_BBOX['min_lon'], UK_BBOX['max_lon'])
+    _ax.set_ylim(UK_BBOX['min_lat'], UK_BBOX['max_lat'])
+    _ax.set_axis_off()
+    _ax
     return
 
 
 @app.cell
-def _(pd):
+def _():
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Risk of wildfires to carbon offset projects
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    1. What is the risk of an offset project being affected by a wildfire?
+        - How does this vary by region?
+    2. Is this risk increasing materially?
+        - How does *this* vary by region?
+    3. How does a wildfire affect the carbon drawdown of an offset project?
+        - Does CO2 drawdown reduce immediately after? Or grow due to rapid new growth?
+        - How long does it take to recover to regular levels?
+    """)
+    return
+
+
+@app.cell
+def _():
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## How can EC help?
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    1. What is the state of the art for:
+        1. Detecting wildfires?
+        2. Monitoring their spread?
+        3. Modelling their future spread?
+    2. Can EC be used to detect wildfires?
+        - Are there any advantages over traditional methods?
+        - If not, can these measurements be supplementary?
+    3. Can EC be used to model the spread of wildfires?
+        - Same as for 2. - advantages? if not, does it add anything?
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ### 1. State of the art
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    #### 1. Detecting wildfires
+    """)
+    return
+
+
+@app.cell
+def _():
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    #### 2. Monitoring spread
+    """)
+    return
+
+
+@app.cell
+def _():
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    #### 3. Modelling spread
+    """)
+    return
+
+
+@app.cell
+def _():
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ### 2. Can EC be used to detect fires?
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    Signals of fire measurement:
+    - Power loss - some variables suddently hit 0/a flagged value (e.g. -9999)
+        - Not all variables are lost. This is worth investigating - is this just because they can be extrapolated easily?
+    - CO2 spike?
+        - Seen in the Warra data, would be useful to know if there are other variables that spike.
+
+    **Need raw data, that hasn't been quality controlled**
+    """)
+    return
+
+
+@app.cell
+def _(TERN_DIR, pd):
     # load flux and meterological data
-    df_warra = pd.read_csv('data/TERN/TERN_AU-Wrr_FLUXNET_2013-2021_v1.3_r1/TERN_AU-Wrr_FLUXNET_FLUXMET_HH_2013-2021_v1.3_r1.csv')
+    warra_dir = TERN_DIR / 'TERN_AU-Wrr_FLUXNET_2013-2021_v1.3_r1'
+    df_warra = pd.read_csv(warra_dir / 'TERN_AU-Wrr_FLUXNET_FLUXMET_HH_2013-2021_v1.3_r1.csv')
 
     # collapse start and end cols into a single period col
     df_warra['TIMESTAMP_START'] = pd.to_datetime(df_warra['TIMESTAMP_START'], format = '%Y%m%d%H%M')
@@ -62,7 +240,7 @@ def _(pd):
     df_warra = df_warra.set_index('TIMESTAMP_START')
 
     # get variable info
-    df_warra_info = pd.read_csv('data/TERN/TERN_AU-Wrr_FLUXNET_2013-2021_v1.3_r1/TERN_AU-Wrr_FLUXNET_BIFVARINFO_HH_2013-2021_v1.3_r1.csv')
+    df_warra_info = pd.read_csv(warra_dir / 'TERN_AU-Wrr_FLUXNET_BIFVARINFO_HH_2013-2021_v1.3_r1.csv')
     df_warra_info = df_warra_info.loc[df_warra_info['VARIABLE_GROUP'] == 'GRP_VAR_INFO'].pivot(
         index = 'GROUP_ID', 
         columns = 'VARIABLE', 
@@ -110,9 +288,8 @@ def _(df_warra_info):
 
 
 @app.cell
-def _(df_warra, pd):
-    from dataclasses import dataclass
-    from typing import Literal
+def _(Literal, dataclass, df_warra, pd):
+
 
     @dataclass
     class FireInfo:
@@ -190,7 +367,7 @@ def _(df_warra, pd):
     )
 
     df_warra['fire_flag'] = ((df_warra.index >= fire_warra.start_date) & (df_warra.index <= fire_warra.end_date)).astype(int)
-    return Literal, fire_warra
+    return (fire_warra,)
 
 
 @app.cell
@@ -310,26 +487,6 @@ def _(fire_warra, pd, plt):
     return
 
 
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    ### Identifying fires
-    """)
-    return
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    Signals of fire measurement:
-    - Power loss - some variables suddently hit 0/a flagged value (e.g. -9999)
-        - Not all variables are lost. This is worth investigating - is this just because they can be extrapolated easily?
-    - CO2 spike?
-        - Seen in the Warra data, would be useful to know if there are other variables that spike.
-    """)
-    return
-
-
 @app.cell
 def _(df_warra):
     flag_cols = [col for col in df_warra if '_QC' in col]
@@ -345,8 +502,8 @@ def _(df_warra):
 
 
 @app.cell
-def _(pd):
-    df_fluxnet_vars = pd.read_csv('data/fluxnet_variables.csv').dropna().rename(columns = {
+def _(FLUXNET_DIR, pd):
+    df_fluxnet_vars = pd.read_csv(FLUXNET_DIR / 'fluxnet_variables.csv' ).dropna().rename(columns = {
         'Variable': 'variable',
         'Units': 'units',
         'Description': 'description'
@@ -547,12 +704,6 @@ def _(df_warra, drop_cols, plt):
 
 
 @app.cell
-def _(df_warra):
-    df_warra
-    return
-
-
-@app.cell
 def _(df_warra, pd, plt):
     ind_has_power = df_warra.index.to_series() <= pd.to_datetime('2019-01-28-16:00:00')
     drop_cols = ['fire_flag', 'TIMESTAMP_END']
@@ -567,12 +718,6 @@ def _(df_warra, pd, plt):
     return df_warra_corr, drop_cols
 
 
-@app.cell
-def _(fire_warra):
-    fire_warra.start_date, fire_warra.end_date
-    return
-
-
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
@@ -580,13 +725,37 @@ def _(mo):
     Siying has been doing this
     - Anomaly detection
     - [Changepoint detection/analysis](https://pmc.ncbi.nlm.nih.gov/articles/PMC5464762/)
-        - If there are changes in the
     """)
     return
 
 
 @app.cell
 def _():
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ### 3. Can EC be used to model fire spread?
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    - Data assimilation with current fire-spread algorithms:
+        Fire-EnSF/WRF-SFIRE/FARSITE
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+ 
+    """)
     return
 
 
