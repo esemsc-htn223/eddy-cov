@@ -1,10 +1,10 @@
 import marimo
 
-__generated_with = "0.23.9"
+__generated_with = "0.24.0"
 app = marimo.App()
 
 
-@app.cell(hide_code=True)
+@app.cell
 def _(mo):
     mo.md(r"""
     # Imports
@@ -19,9 +19,11 @@ def _():
     import geopandas as gpd
 
     from matplotlib import pyplot as plt
+    from matplotlib_scalebar.scalebar import ScaleBar
     import altair as alt
+    import folium
 
-    from shapely.geometry import LineString, MultiPoint, Point
+    from shapely.geometry import LineString, MultiPoint, Point, box
 
     import os
     import zipfile
@@ -32,197 +34,140 @@ def _():
     import requests
     import sys
     import time
+    from tqdm import tqdm
 
     from icoscp_core.icos import meta, ECO_STATION
     from icoscp_core.queries.dataobjlist import SamplingHeightFilter
 
-    return (
-        ECO_STATION,
-        LineString,
-        datetime,
-        gpd,
-        meta,
-        mo,
-        np,
-        os,
-        pd,
-        plt,
-        requests,
-        shuttle,
-        zipfile,
-    )
+    return ECO_STATION, gpd, meta, mo, np, os, pd, plt
 
 
-@app.cell(hide_code=True)
+@app.cell
+def _():
+    import eddy
+
+    return (eddy,)
+
+
+@app.cell
 def _(mo):
     mo.md(r"""
-    # Natural Earth
+    # Data
     """)
     return
 
 
 @app.cell
-def _(gpd, mo):
-    gdf_coastline = gpd.read_file('/Users/hugoneely/Documents/4-work/1-current/PhD/repos/eddy-cov/data/NaturalEarth/ne_110m_coastline')
-    gdf_states = gpd.read_file('/Users/hugoneely/Documents/4-work/1-current/PhD/repos/eddy-cov/data/NaturalEarth/ne_110m_admin_1_states_provinces')
-    _ax_coast = gdf_coastline.plot(linewidth = 0.5, color = 'k')
+def _(mo):
+    mo.md(r"""
+    ## Natural Earth - Borders & Coastlines
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    from eddy.data import GDF_COUNTRIES, GDF_STATES
+    _ax_coast = GDF_COUNTRIES.plot(linewidth = 0.25, facecolor = 'None', edgecolor = 'k')
     _ax_coast.set_axis_off()
-    _ax_coast.set_title('gdf_coastline: Global Coastline')
-    _ax_states = gdf_states.plot(facecolor = 'None', linewidth = 0.5)
+    _ax_coast.set_title('GDF_COUNTRIES: Country Borders')
+    _ax_states = GDF_STATES.plot(facecolor = 'None', linewidth = 0.25)
     _ax_states.set_axis_off()
-    _ax_states.set_title('gdf_states: US States')
+    _ax_states.set_title('GDF_STATES: Country Borders + Internal State Borders')
     mo.vstack([
         mo.hstack([
             _ax_coast,
             _ax_states
-        ], gap = 0.1),
+        ], gap = 1, justify = 'space-around'),
         mo.accordion({
-            '`gdf_coastline`': gdf_coastline,
-            '`gdf_states`': gdf_states
+            '`GDF_COUNTRIES`': GDF_COUNTRIES,
+            '`GDF_STATES`': GDF_STATES
         })
     ])
-    return gdf_coastline, gdf_states
+    return GDF_COUNTRIES, GDF_STATES
 
 
-@app.cell(hide_code=True)
+@app.cell
 def _(mo):
     mo.md(r"""
-    # Fluxnet
+    ## Flux data
     """)
     return
 
 
 @app.cell
-async def _(datetime, gpd, os, pd, shuttle):
-    #fname = await shuttle.listall(output_dir = 'data')
-    def get_fname(search_dir = 'data'):
-        files = os.listdir(search_dir)
-        files = [f for f in files if f.endswith('.csv') and f.startswith('fluxnet_shuttle_snapshot_')]
-        if len(files) == 0:
-            raise FileNotFoundError(f"No CSV files found in directory {dir}.")
-        file_dt = [datetime.datetime.strptime(f.split('_')[-1].replace('.csv', ''), '%Y%m%dT%H%M%S') for f in files]
-        files = [f for _, f in sorted(zip(file_dt, files), reverse=True)]
-        return os.path.join(search_dir, files[0])
-
-
-    try:
-        fname = get_fname()
-        print(f'loaded latest file with fname="{fname}" from disk')
-    except FileNotFoundError as e:
-        fname = await shuttle.listall(output_dir = 'data')
-        print(f'downloaded file with fname="{fname}" from shuttle')
-    gdf_locs = pd.read_csv(fname)
-    gdf_locs = gpd.GeoDataFrame(gdf_locs, geometry=gpd.points_from_xy(gdf_locs['location_long'], gdf_locs['location_lat']))
-    gdf_locs
-    return fname, gdf_locs
+def _(mo):
+    mo.md(r"""
+    ### Fluxnet
+    """)
+    return
 
 
 @app.cell
-def _(gdf_coastline, gdf_locs, plt):
-    _fig, _ax = plt.subplots(figsize = (10,20))
-    gdf_coastline.plot(ax=_ax, color = 'k', linewidth = 0.5)
-    _ax.scatter(gdf_locs['location_long'], gdf_locs['location_lat'], color = 'red', s = 0.5, alpha = 0.5)
+async def _(eddy):
+    gdf_fluxnet = await eddy.data.load_fluxnet_snapshot()
+    gdf_fluxnet_path = await eddy.data.load_fluxnet_snapshot(return_type = 'path')
+    gdf_fluxnet
+    return gdf_fluxnet, gdf_fluxnet_path
+
+
+@app.cell
+def _(GDF_COUNTRIES, gdf_fluxnet, gdf_wind, plt):
+    _uk_bbox = (-7.57216793459, 49.959999905, 1.68153079591, 58.6350001085)
+    _fig, _ax = plt.subplots(figsize=(10, 10))
+    gdf_fluxnet.loc[gdf_fluxnet['location_lat'].between(_uk_bbox[1], _uk_bbox[3]) & gdf_fluxnet['location_long'].between(_uk_bbox[0], _uk_bbox[2])].plot(
+        marker='o', color='red', markersize=10, figsize=(10, 10), alpha=0.7, ax=_ax
+    )
+    GDF_COUNTRIES.plot(ax=_ax, linewidth=0.25, facecolor='None')
+    gdf_wind.plot(ax=_ax, markersize=2, color='green', alpha = 0.5)
+    _ax.set_xlim(_uk_bbox[0], _uk_bbox[2])
+    _ax.set_ylim(_uk_bbox[1], _uk_bbox[3])
     _ax.set_axis_off()
     _ax
     return
 
 
 @app.cell
-async def _(fname, os, retur, shuttle):
+def _(gdf_fluxnet):
+    gdf_fluxnet.loc[gdf_fluxnet['site_id'].str.startswith('UK-')]
+    return
+
+
+@app.cell
+def _(GDF_COUNTRIES, gdf_fluxnet, plt):
+    _fig, _ax = plt.subplots(figsize = (10,20))
+    GDF_COUNTRIES.plot(ax=_ax, facecolor = 'None', linewidth = 0.25)
+    _ax.scatter(gdf_fluxnet['location_long'], gdf_fluxnet['location_lat'], color = 'red', s = 0.25, alpha = 0.5)
+    _ax.set_axis_off()
+    _ax
+    return
+
+
+@app.cell
+async def _(eddy, gdf_fluxnet_path):
     sites = ['UK-HpF']
-    def get_fnames(search_dir = os.path.join('data','sites')):
-        if not os.path.isdir(search_dir):
-            raise NotADirectoryError(f"Directory {search_dir} does not exist.")
-        retur
-
-    fnames = await shuttle.download(sites, snapshot_file=fname, output_dir = os.path.join('data', 'sites'))
-    fnames
-    return (fnames,)
+    fluxnet_site_folders = await eddy.data.load_fluxnet_sites(
+        sites, snapshot_filepath = gdf_fluxnet_path, force_download = False, 
+        extract_zip = True
+    )
+    fluxnet_site_folders
+    return (fluxnet_site_folders,)
 
 
 @app.cell
-def _(fnames, os, zipfile):
-    site_dir = os.path.join('data', 'sites', 'UK-HpF')
-    with zipfile.ZipFile(fnames[0], 'r') as zip_ref:
-        zip_ref.extractall(site_dir)
-    return (site_dir,)
-
-
-@app.cell
-def _(mo, os, site_dir):
-    mo.md(open(os.path.join(site_dir, 'README.txt')).read())
+def _(fluxnet_site_folders, mo, os):
+    _site_dir = fluxnet_site_folders[0]
+    mo.accordion({
+        'README': mo.plain_text(open(os.path.join(_site_dir, 'README.txt')).read()),
+        'Dir contents': [_f.name for _f in sorted(_site_dir.iterdir())]
+    }, multiple = True, lazy = True)
     return
 
 
 @app.cell
-def _(os, site_dir):
-    csvs = [os.path.join(site_dir, _f) for _f in os.listdir(site_dir) if _f.endswith('.csv')]
-    csvs
-    return (csvs,)
-
-
-@app.cell
-def _(csvs, pd):
-    pd.read_csv(csvs[1])
-    return
-
-
-@app.cell
-def _(csvs, pd):
-    _df_info = pd.read_csv(csvs[14])
-    _var_to_search = 'TA_F_MDS'
-    _grp = _df_info.loc[_df_info['DATAVALUE'] == _var_to_search, 'GROUP_ID'].values[0]
-    _df_info.loc[_df_info['GROUP_ID'] == _grp, ['VARIABLE', 'DATAVALUE']]
-    return
-
-
-@app.cell
-def _(csvs, pd):
-    pd.read_csv(csvs[14])
-    return
-
-
-@app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    # Raw data
-    [bico](https://github.com/holukas/bico/tree/master/src) - SwissFluxNet tool for reading raw EC data. Doesn't run on M-series macs, but could virtualise? Not yet set up.
-    """)
-    return
-
-
-@app.cell
-def _(np):
-    np.fromfile('data/downloader/buoy.ecflux.z01.00.20231227.160000.10hz.dat', dtype=np.float32)
-    return
-
-
-@app.cell
-def _(pd):
-    pd.read_csv('downloader/buoy.ecflux.z01.00.20231227.160000.10hz.dat',)
-    return
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    # Weather stations
-    """)
-    return
-
-
-@app.cell
-def _(requests):
-    response = requests.get('https://www.ncei.noaa.gov/pub/data/ghcn/daily/ghcnd-stations.txt')
-    with open('data/ghcnd-stations.txt', 'wb') as _f:
-        _f.write(response.content)
-    return
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    # AmeriFlux
+    ### AmeriFlux
     [BADM Standards](https://ameriflux.lbl.gov/data/badm/badm-standards/) - for variable names/definitions
     """)
     return
@@ -230,41 +175,51 @@ def _(mo):
 
 @app.cell
 def _(gpd, pd):
-    df_af_badm = pd.read_excel('data/AmeriFlux/AMF_AA-Flx_BIF_CCBY4_20260527.xlsx')
-    df_af_badm = df_af_badm.loc[df_af_badm['VARIABLE_GROUP'] == 'GRP_LOCATION'].pivot_table(index = 'GROUP_ID', columns = 'VARIABLE', values = 'DATAVALUE', aggfunc = 'first')
-    df_af_badm = df_af_badm.join(
-        pd.read_excel('data/AmeriFlux/AMF_AA-Flx_BIF_CCBY4_20260527.xlsx', usecols = ['SITE_ID', 'GROUP_ID']).groupby('GROUP_ID').agg('first')
-    ).set_index('SITE_ID')
+    _cols = ['FLUX_MEASUREMENTS_DATE_START', 'FLUX_MEASUREMENTS_DATE_END', 'LOCATION_DATE_START', 'LOCATION_COMMENT', 'LOCATION_LAT', 'LOCATION_LONG', 'LOCATION_ELEV']
+    # read only the values we want from the flat-structured excel file
+    df_ameriflux_badm = pd.read_excel(
+        'data/AmeriFlux/AMF_AA-Flx_BIF_CCBY4_20260527.xlsx', 
+        usecols = ['SITE_ID', 'VARIABLE', 'DATAVALUE']
+    ).loc[lambda _df: _df['VARIABLE'].isin(_cols)]
 
-    gdf_af_badm = gpd.GeoDataFrame(df_af_badm, geometry = gpd.points_from_xy(df_af_badm['LOCATION_LONG'], df_af_badm['LOCATION_LAT']))
-    gdf_af_badm.set_crs('EPSG:4326', inplace = True)
-    del df_af_badm
-    gdf_af_badm
-    return (gdf_af_badm,)
+    df_ameriflux_badm = df_ameriflux_badm.pivot_table(index = 'SITE_ID', columns = 'VARIABLE', values = 'DATAVALUE', aggfunc = 'first')  # pivot to non-flat format
+    df_ameriflux_badm = df_ameriflux_badm[_cols]  # re-order
+
+    gdf_ameriflux_badm = gpd.GeoDataFrame(df_ameriflux_badm, geometry = gpd.points_from_xy(df_ameriflux_badm['LOCATION_LONG'], df_ameriflux_badm['LOCATION_LAT']))
+    gdf_ameriflux_badm.set_crs('EPSG:4326', inplace = True)
+    del df_ameriflux_badm
+    gdf_ameriflux_badm
+    return (gdf_ameriflux_badm,)
 
 
 @app.cell
-def _(gdf_af_badm, gpd, pd):
-    #df_af = pd.read_excel('data/AmeriFlux/AMF_AA-Flx_BIF_CCBY4_20260527.xlsx')
-    df_af = pd.read_csv('data/AmeriFlux/BASE_MeasurementHeight_20260527.csv')
-    df_af['var_base'] = df_af['Variable'].str.split('(_\d)+', regex=True).apply(lambda x: x[0])
+def _(gdf_ameriflux_badm, gpd, pd):
+    #df_ameriflux = pd.read_excel('data/AmeriFlux/AMF_AA-Flx_BIF_CCBY4_20260527.xlsx')
+    df_ameriflux = pd.read_csv('data/AmeriFlux/BASE_MeasurementHeight_20260527.csv')
+    df_ameriflux['var_base'] = df_ameriflux['Variable'].str.split('(_\d)+', regex=True).apply(lambda x: x[0])
 
-    df_af = df_af.join(
+    df_ameriflux = df_ameriflux.join(
         pd.read_csv('data/AmeriFlux/flux-met_processing_variables_20260618.csv', index_col = 1), on = 'var_base'
     ).sort_values(['Site_ID', 'Variable'])
-    df_af = df_af.loc[df_af['Type'] == 'MET_WIND']
-    gdf_af = gpd.GeoDataFrame(df_af.join(gdf_af_badm['geometry'], on = 'Site_ID').sort_values(['Site_ID', 'Variable'])).reset_index(drop = True)
-    gdf_af.set_crs('EPSG:4326', inplace = True)
-    del df_af
-    gdf_af
-    return (gdf_af,)
+    df_ameriflux = df_ameriflux.loc[df_ameriflux['Type'] == 'MET_WIND']
+    gdf_ameriflux = gpd.GeoDataFrame(df_ameriflux.join(gdf_ameriflux_badm[['geometry', 'FLUX_MEASUREMENTS_DATE_START', 'FLUX_MEASUREMENTS_DATE_END']], on = 'Site_ID').sort_values(['Site_ID', 'Variable'])).reset_index(drop = True)
+    gdf_ameriflux.set_crs('EPSG:4326', inplace = True)
+    del df_ameriflux
+    gdf_ameriflux
+    return (gdf_ameriflux,)
 
 
 @app.cell
-def _(gdf_af, gdf_coastline, plt):
+def _(gdf_fluxnet):
+    gdf_fluxnet
+    return
+
+
+@app.cell
+def _(GDF_COUNTRIES, gdf_ameriflux, plt):
     _fig, _ax = plt.subplots(figsize = (10,20))
-    gdf_coastline.plot(ax=_ax, color = 'k', linewidth = 0.5)
-    gdf_af.dissolve(by = 'Site_ID', aggfunc = {'Height':'max'}).plot(
+    GDF_COUNTRIES.plot(ax=_ax, facecolor = 'None', linewidth = 0.5)
+    gdf_ameriflux.dissolve(by = 'Site_ID', aggfunc = {'Height':'max'}).plot(
         'Height',
         color = 'red', markersize = 0.5, alpha = 0.5,
         ax = _ax
@@ -275,35 +230,35 @@ def _(gdf_af, gdf_coastline, plt):
 
 
 @app.cell
-def _(gdf_af):
-    gdf_af.plot.box(column = 'Height', by = 'var_base', figsize = (8,15), vert = False, grid = True).values[0]
-    return
-
-
-@app.cell
-def _(gdf_af):
-    gdf_af.loc[gdf_af['Height'] > 75]
-    return
-
-
-@app.cell
-def _(gdf_af):
-    gdf_af.loc[gdf_af['geometry'].isna(),'Site_ID'].value_counts().sort_index()
-    return
-
-
-@app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    # ICOS
+    ### ICOS
     """)
     return
 
 
-@app.cell(hide_code=True)
+@app.cell
 def _(mo):
     mo.md(r"""
-    Seems measurement height metadata isn't available via the `icoscp_core` package. Will have to look into BADM. Might be available by bulk? Otherwise, will have to find individually for each site.
+    - measurement height metadata isn't available via the `icoscp_core` package.
+
+    Email response:
+    ```email
+    ​Hi Hugo,
+
+    Within our data portal, the EC sensor height is available as part of the Archive file (example).
+
+    In the example, there are two files with variable information:
+    - ICOSETC_NL-Loo_VARINFO_METEO_L2.csv (which has the sonic anemometer (WS / Gill HS-50 at 38.2 m))
+    - ICOSETC_NL-Loo_VARINFO_FLUXES_L2.csv (which has the gas analyser (CO2, H2O, etc. / LI-7200RS at 38.2 m))
+
+    It would theoretically be possible to script through the various files, if you had them all in the same directory, e.g., but that is obviously not particularly convenient.
+
+    I am unsure if there is a simpler/better way to get this information, but the Ecosystem Thematic Centre might be able to help you get the data in a more convenient way. I would suggest contacting them directly at info@icos-etc.eu
+
+    Best,
+    Andrew
+    ```
     """)
     return
 
@@ -367,22 +322,24 @@ def _(dobjs_by_station, meta, np):
     return
 
 
-@app.cell(hide_code=True)
+@app.cell
 def _(mo):
     mo.md(r"""
-    # Wind
+    ## Wind
     """)
     return
 
 
 @app.cell
-def _(gpd, mo, pd):
+def _(GDF_COUNTRIES, gpd, mo, pd):
     df_wind = pd.read_excel('data/wind/Global-Wind-Power-Tracker-February-2026.xlsx', sheet_name = 'Data')
     gdf_wind = gpd.GeoDataFrame(df_wind, geometry=gpd.points_from_xy(df_wind['Longitude'], df_wind['Latitude']))
     gdf_wind.set_crs('EPSG:4326', inplace = True)
+    gdf_wind['project'] = gdf_wind['Project Name'].astype(str) + ', phase ' + gdf_wind['Phase Name'].astype(str)
     del df_wind
 
-    ax = gdf_wind.plot(column = 'Capacity (MW)', figsize = (10,20), legend = False, markersize = 0.5, alpha = 0.5)
+    ax = gdf_wind.plot(column = 'Capacity (MW)', figsize = (10,20), legend = False, markersize = 0.1, alpha = 0.1)
+    GDF_COUNTRIES.plot(ax=ax, facecolor = 'None', linewidth = 0.25)
     ax.set_axis_off()
     mo.vstack([
         ax,
@@ -392,107 +349,48 @@ def _(gpd, mo, pd):
 
 
 @app.cell
-def _(gdf_states, gdf_wind):
+def _(GDF_STATES, gdf_wind, mo):
     gdf_wind_us = gdf_wind.loc[gdf_wind['Country/Area'] == 'United States']
     _ax = gdf_wind_us.to_crs('ESRI:102003').plot(column = 'Capacity (MW)', figsize = (10,20), legend = False, markersize = 0.5, alpha = 0.5)
-    gdf_states.clip_by_rect(*gdf_wind_us.total_bounds).to_crs('ESRI:102003').plot(ax = _ax, facecolor = 'None', linewidth = 0.5)
+    GDF_STATES.clip_by_rect(*gdf_wind_us.total_bounds).to_crs('ESRI:102003').plot(ax = _ax, facecolor = 'None', linewidth = 0.5)
     _ax.set_axis_off()
-    _ax
-    return (gdf_wind_us,)
+    _ax.set_title('Wind Farms in the US')
 
-
-@app.cell
-def _(gdf_states):
-    _bnds = [-1997481.6625468, -150098.36507867, -88060.94924008, 1229139.94296026]
-    #for _i, _val in enumerate(gdf_states.to_crs('ESRI:102003').clip_by_rect(*_bnds)):
-    #    print(_i, _val.centroid)
-    #    print(gdf_states.iloc[_i]['postal'])
-
-    gdf_states.to_crs('ESRI:102003').clip_by_rect(*_bnds)
+    mo.vstack([
+        _ax,
+        gdf_wind_us
+    ])
     return
 
 
 @app.cell
-def _(LineString, gdf_af, gdf_states, gdf_wind_us, mo, pd, plt):
-    PAD = 10000
-    MIN_HEIGHT = 50
-
-    MARKER_WIND = '1'
-    MARKER_SIZE_WIND = 100
-    MARKER_WIDTH_WIND = 0.75
-    COLOUR_WIND = 'blue'
-
-    MARKER_SIZE_EC = 25
-    MARKER_EC = '^'
-    COLOUR_EC = 'green'
-
-    ALPHA = 0.5
-
-    gdf_af_temp = gdf_af.dissolve(by = 'Site_ID', aggfunc = {'Height': 'max'}).to_crs('ESRI:102003')
-    gdf_af_temp['geometry_af'] = gdf_af_temp['geometry']
-    gdf_af_temp.to_crs('ESRI:102003', inplace = True)
-    gdf_nbrs = gdf_wind_us[['Project Name', 'Capacity (MW)', 'geometry']].to_crs('ESRI:102003').sjoin_nearest(
-        gdf_af_temp[['Height', 'geometry_af', 'geometry']],
-        how = 'left', distance_col = 'dist_m',
-        max_distance = 100_000,
-    )
-    del gdf_af_temp
-
-    height_ind = gdf_nbrs['Height'] >= MIN_HEIGHT
-
-    _fig, _ax = plt.subplots(1,1, figsize = (7, 5))
-
-    # zoom in to the area around the wind turbines with height >= MIN_HEIGHT
-    _bounds = gdf_nbrs.loc[height_ind].total_bounds
-    _bounds[0:2] = _bounds[0:2] - PAD
-    _bounds[2:4] = _bounds[2:4] + PAD
-
-    gdf_nbrs.loc[height_ind].plot(  # wind
-        color = COLOUR_WIND,
-        ax = _ax, 
-        markersize = MARKER_SIZE_WIND, alpha = ALPHA, 
-        marker = MARKER_WIND, linewidth = MARKER_WIDTH_WIND
-    )
-    gdf_nbrs.set_geometry('geometry_af').loc[height_ind].plot(  # eddy covariance
-        color = COLOUR_EC, 
-        ax = _ax, 
-        legend = False, 
-        markersize = MARKER_SIZE_EC, alpha = ALPHA,
-        marker = MARKER_EC
-    )
-
-    gdf_states.to_crs('ESRI:102003').plot(ax=_ax, facecolor = 'None', linewidth = 0.5, autolim = False, zorder = 0)
-
-    # lines
-    gdf_nbrs.loc[height_ind].apply(lambda row: LineString([row['geometry'].centroid, row['geometry_af'].centroid]) if not pd.isnull(row[['geometry_af', 'geometry']].values).any() else None, axis = 1).plot(
-        linewidth = 0.1, color = 'grey',
-        ax = _ax
-    )
-    _legend = _ax.legend(
-        ['Wind Turbine', 'Eddy Covariance Tower'],
-        loc = 'upper right',
-        markerscale = 1,
-        fontsize = 10,
-        frameon = True,
-        fancybox = True,
-        framealpha = 0.5
-    )
-
-    _ax.set_axis_off()
-
-
-    mo.vstack([
-        #mo.ui.matplotlib(_ax),
-        _ax,
-        gdf_nbrs.loc[height_ind],
-        _bounds
-    ], align = 'center')
-    return gdf_nbrs, height_ind
+def _(mo):
+    mo.md(r"""
+    ## Raw data
+    [bico](https://github.com/holukas/bico/tree/master/src) - SwissFluxNet tool for reading raw EC data. Doesn't run on M-series macs, but could virtualise? Not yet set up.
+    """)
+    return
 
 
 @app.cell
-def _(gdf_nbrs, height_ind):
-    gdf_nbrs[height_ind]['dist_m'].describe().astype(int)
+def _(np):
+    np.fromfile('data/downloader/buoy.ecflux.z01.00.20231227.160000.10hz.dat', dtype=np.float32)
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ## Weather stations
+    """)
+    return
+
+
+@app.cell
+def _():
+    # response = requests.get('https://www.ncei.noaa.gov/pub/data/ghcn/daily/ghcnd-stations.txt')
+    # with open('data/ghcnd-stations.txt', 'wb') as _f:
+    #     _f.write(response.content)
     return
 
 
