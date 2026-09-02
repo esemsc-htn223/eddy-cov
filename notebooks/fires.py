@@ -15,7 +15,7 @@ def _(mo):
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    ## Imports & Data
+    ## Imports
     """)
     return
 
@@ -37,11 +37,29 @@ def _():
 
 
 @app.cell
-async def _():
+def _():
     import eddy
-    from eddy.data import DATA_DIR, FLUXNET_DIR, TERN_DIR
-    GDF_COUNTRIES = eddy.data.load_natural_earth_countries()
-    GDF_STATES = eddy.data.load_natural_earth_states()
+
+    # get dirs too
+    from eddy.flux.data import FLUX_DIR, FLUXNET_DIR, TERN_DIR, AMERIFLUX_DIR
+    from eddy.util import DATA_DIR, OUT_DIR
+
+    return DATA_DIR, FLUXNET_DIR, TERN_DIR, eddy
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Data
+    """)
+    return
+
+
+@app.cell
+async def _(eddy):
+    # geographic data
+    GDF_COUNTRIES = eddy.load_natural_earth_countries()
+    GDF_STATES = eddy.load_natural_earth_states()
 
     #_uk_bbox = (-7.57216793459, 49.959999905, 1.68153079591, 58.6350001085)
     UK_BBOX = {
@@ -50,9 +68,8 @@ async def _():
         'min_lat': 49.0,
         'max_lat': 61.0
     }
-
     gdf_fluxnet = await eddy.data.load_fluxnet_snapshot()
-    return DATA_DIR, FLUXNET_DIR, GDF_COUNTRIES, TERN_DIR, UK_BBOX, gdf_fluxnet
+    return GDF_COUNTRIES, UK_BBOX, gdf_fluxnet
 
 
 @app.cell(hide_code=True)
@@ -75,7 +92,7 @@ def _(mo):
 
 @app.cell
 def _(DATA_DIR, GDF_COUNTRIES, UK_BBOX, gpd, plt):
-    gdf_offset_uk = gpd.read_file(DATA_DIR / 'offsets/Woodland_Carbon_Code_Projects_Read_Only_View_7714146472369880997.geojson')
+    gdf_offset_uk = gpd.read_file(DATA_DIR / 'offsets' / 'Woodland_Carbon_Code_Projects_Read_Only_View_7714146472369880997.geojson')
 
     _fig, _ax = plt.subplots(figsize=(10, 10))
     gdf_offset_uk.plot(facecolor='green', ax = _ax)
