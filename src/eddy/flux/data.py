@@ -1,4 +1,7 @@
-__all__ = ['GDF_COUNTRIES', 'GDF_STATES', 'load_fluxnet_snapshot']
+__all__ = [
+    'FLUX_DIR', 'FLUXNET_DIR', 'TERN_DIR', 'AMERIFLUX_DIR',
+    'load_fluxnet_snapshot', 'load_fluxnet_sites'
+]
 
 import fluxnet_shuttle as shuttle
 import pandas as pd
@@ -21,14 +24,6 @@ _dirs = [FLUX_DIR, FLUXNET_DIR, TERN_DIR, AMERIFLUX_DIR]
 for _dir in _dirs:
     if not _dir.exists():
         os.makedirs(_dir)
-
-# TODO: download Natural Earth data if not present
-def load_natural_earth_countries():
-    return gpd.read_file(DATA_DIR / 'NaturalEarth' / 'ne_10m_admin_0_map_subunits')
-def load_natural_earth_states():
-    return gpd.read_file(DATA_DIR / 'NaturalEarth' / 'ne_10m_admin_1_states_provinces')
-
-
 
 def _get_latest_fluxnet_snapshot_path():
     '''Find the latest FLUXNET snapshot file on disk, or raise an error if none are found.'''
@@ -73,6 +68,9 @@ async def load_fluxnet_snapshot(*, return_type: Literal['gdf', 'df', 'path'] = '
             print(f'No local snapshot file found, downloading from FLUXNET.')
             logger_data.info('DOWNLOADING FLUXNET SNAPSHOT - no local file found')
             snapshot_filepath = await shuttle.listall(output_dir = FLUXNET_DIR)
+
+    snapshot_date = datetime.datetime.strptime(snapshot_filepath.name.split('_')[-1].replace('.csv', ''), '%Y%m%dT%H%M%S')
+    print(f'Loaded FLUXNET snapshot from {snapshot_date}')
 
     if return_type == 'path':
         return snapshot_filepath
