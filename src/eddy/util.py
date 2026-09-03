@@ -1,14 +1,22 @@
-__all__ = ["DATA_DIR", "OUT_DIR", "LOG_DIR", "load_natural_earth_countries", "load_natural_earth_states"]
+__all__ = [
+    'DATA_DIR', 'OUT_DIR', 'LOG_DIR',
+    'BASE_CRS', 'DISTANCE_CRS', 'PLOTTING_CRS',
+    'logger_data', 'logger_processing'
+]
 
 import os
 import pathlib
 import logging
-import geopandas as gpd
+
+BASE_CRS = 'EPSG:3857'  # Web Mercator projection for mapping and distance calculations (units in meters)
+#BASE_CRS = 'EPSG:4326'  # WGS 84 projection for mapping and distance calculations (units in degrees)
+DISTANCE_CRS = 'EPSG:3857'  # Web Mercator projection for distance calculations (units in meters)
+PLOTTING_CRS = 'EPSG:4326'  # WGS 84 projection for plotting (units in degrees)
 
 
-DATA_DIR = pathlib.Path(__file__).parent.parent.parent / "data"
-OUT_DIR = pathlib.Path(__file__).parent.parent.parent / "out"
-LOG_DIR = pathlib.Path(__file__).parent.parent.parent / "log"
+DATA_DIR = pathlib.Path(__file__).parent.parent.parent / 'data'
+OUT_DIR = pathlib.Path(__file__).parent.parent.parent / 'out'
+LOG_DIR = pathlib.Path(__file__).parent.parent.parent / 'log'
 
 dirs = [DATA_DIR, OUT_DIR, LOG_DIR]
 for _dir in dirs:
@@ -32,11 +40,5 @@ for logger, log_file in log_files.items():
     logger_fh.setFormatter(logger_formatter)
     logger.addHandler(logger_fh)
 
-
-# TODO: find a home for natural earth data functions
-# TODO: download Natural Earth data if not present
-def load_natural_earth_countries():
-    return gpd.read_file(DATA_DIR / 'NaturalEarth' / 'ne_10m_admin_0_map_subunits')
-def load_natural_earth_states():
-    return gpd.read_file(DATA_DIR / 'NaturalEarth' / 'ne_10m_admin_1_states_provinces')
-
+logger_data = logging.getLogger('eddy_data')
+logger_processing = logging.getLogger('eddy_processing')

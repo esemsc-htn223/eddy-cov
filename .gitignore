@@ -222,7 +222,7 @@ __marimo__/
 
 # pixi environments
 .vscode
-data/
+/data/
 downloader/
 out/
 

@@ -1,8 +1,10 @@
-from eddy import util, flux, wind, offsets
-from eddy.util import load_natural_earth_countries, load_natural_earth_states
+from eddy import flux, wind, offset, data
+from eddy.util import DATA_DIR, OUT_DIR, BASE_CRS, PLOTTING_CRS, DISTANCE_CRS
 
 
 __all__ = [
-    "util", "flux", "wind", "offsets", 
-    "load_natural_earth_countries", "load_natural_earth_states"
+    'flux', 'wind', 'offset', 
+    'data', 
+    'BASE_CRS', 'PLOTTING_CRS', 'DISTANCE_CRS',
+    'DATA_DIR', 'OUT_DIR'
 ]

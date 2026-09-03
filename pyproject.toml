@@ -34,6 +34,8 @@ folium = ">=0.20.0,<0.21"
 ipywidgets = ">=8.1.9,<9"
 duckdb = ">=1.5.5,<2"
 sqlglot = ">=30.17.0,<31"
+xyzservices = ">=2026.3.0,<2027"
+python-dotenv = ">=1.2.3,<2"
 
 [tool.pixi.pypi-dependencies]
 eddy-cov = { path = ".", editable = true }

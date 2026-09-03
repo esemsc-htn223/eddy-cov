@@ -14,6 +14,7 @@ import os
 import datetime
 
 from eddy.util import DATA_DIR, logger_data
+from eddy.data.common import standardise_df, _standardise_df
 
 FLUX_DIR = DATA_DIR / 'flux'
 FLUXNET_DIR = FLUX_DIR / 'FLUXNET'
@@ -35,7 +36,7 @@ def _get_latest_fluxnet_snapshot_path():
     latest_file = max(files, key=lambda f: datetime.datetime.strptime(f.name.split('_')[-1].replace('.csv', ''), '%Y%m%dT%H%M%S'))
     return FLUXNET_DIR / latest_file
 
-async def load_fluxnet_snapshot(*, return_type: Literal['gdf', 'df', 'path'] = 'gdf', force_download=False):
+async def load_fluxnet_snapshot(*, return_type: Literal['gdf', 'df', 'path'] = 'gdf', force_download:bool=False) -> gpd.GeoDataFrame | pd.DataFrame | pathlib.Path:
     '''
     Loads the latest FLUXNET snapshot from disk, or downloads it if none have been downloaded.
     Must be run in an async context (`async with` or `await load_fluxnet_snapshot()`) due to
@@ -74,11 +75,11 @@ async def load_fluxnet_snapshot(*, return_type: Literal['gdf', 'df', 'path'] = '
 
     if return_type == 'path':
         return snapshot_filepath
-    out = pd.read_csv(snapshot_filepath)
+    out = _standardise_df(pd.read_csv(snapshot_filepath))
     if return_type == 'df':
         return out
-    out = gpd.GeoDataFrame(out, geometry=gpd.points_from_xy(out['location_long'], out['location_lat']))
-    out.set_crs(epsg=4326, inplace=True)
+    out = gpd.GeoDataFrame(out, geometry=gpd.points_from_xy(out['location_long'], out['location_lat'], crs = 'EPSG:4326'))
+    out = _standardise_df(out)  # ensure geometry and CRS are set correctly
     return out
 
 
