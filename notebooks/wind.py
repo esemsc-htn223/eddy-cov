@@ -43,24 +43,28 @@ def _():
     import sys
     import time
     from tqdm import tqdm
+    import pathlib
+    from netCDF4 import Dataset
+
+    from typing import Literal
+
 
     import xyzservices.providers as xyz
     from dotenv import load_dotenv
     load_dotenv()
     return (
+        Dataset,
         LineString,
-        Point,
+        Literal,
         ScaleBar,
-        box,
         folium,
         gpd,
         mo,
         nearest_points,
         np,
-        os,
+        pathlib,
         pd,
         plt,
-        xyz,
     )
 
 
@@ -74,7 +78,7 @@ def _():
     from eddy.data import _standardise_df as standardise_df
 
 
-    return FLUX_DIR, OUT_DIR, eddy
+    return FLUX_DIR, eddy
 
 
 @app.cell(hide_code=True)
@@ -158,14 +162,19 @@ def _(mo):
 
 
 @app.cell
-def _(gpd, np):
+def _(gpd, np, pd):
     def wind_ec_matches(
-            gdf_wind: gpd.GeoDataFrame, gdf_ec: gpd.GeoDataFrame, 
+            gdf_wind: gpd.GeoDataFrame, 
+            gdf_ec: gpd.GeoDataFrame, 
             *,
-            site_id_col: str = 'Site_ID', height_col: str = 'Height',
-            min_height: int|None = None, max_match_dist: int = 100_000, 
+            date: pd.Timestamp|None = None,
+            min_height: int|None = None, 
+            bounds: tuple|None = None,
             crs: str = 'EPSG:3857',
-            bounds: tuple|None = None
+            site_id_col: str = 'site_id', 
+            height_col: str = 'height',
+            max_match_dist: int = 100_000, 
+            only_overlap: bool = False
         ):
         '''
         Match wind turbine locations to their nearest eddy covariance tower location.
@@ -176,16 +185,25 @@ def _(gpd, np):
             GeoDataFrame containing wind turbine locations and attributes.
         gdf_ec : geopandas.GeoDataFrame
             GeoDataFrame containing eddy covariance tower locations and attributes.
+        date : pd.Timestamp, optional
+            Date to filter wind turbines and eddy covariance towers by their operational status.
+            If None, all turbines are included.
         min_height : int, optional
             Minimum height of eddy covariance towers to include. If None, all towers are included. Defaults to None.
             If specified, `gdf_ec` must contain the specified `height_col` with the measurement heights.
-        crs : str, optional
-            Coordinate reference system to use for matching. Defaults to 'EPSG:3857' (Web Mercator).
-        max_match_dist : int, optional
-            Maximum distance (in meters) to consider a wind turbine as a match for an eddy covariance tower. Defaults to 100,000 m.
         bounds : tuple, optional
             Bounds to apply to the matching in the form (minx, miny, maxx, maxy). If None (default), all towers and turbines are considered. 
             If specified, only towers and turbines within the bounds are considered.
+        crs : str, optional
+            Coordinate reference system to use for matching. Defaults to 'EPSG:3857' (Web Mercator).
+        site_id_col : str, optional
+            Column name in `gdf_ec` that contains the unique site IDs for the eddy covariance towers. Defaults to 'site_id'.
+        height_col : str, optional
+            Column name in `gdf_ec` that contains the measurement heights of the eddy covariance towers. Defaults to 'height'. 
+            This column is required if `min_height` is specified.
+        max_match_dist : int, optional
+            Maximum distance (in meters) to consider a wind turbine as a match for an eddy covariance tower. Defaults to 100,000 m.
+
 
         Returns
         -------
@@ -193,61 +211,74 @@ def _(gpd, np):
             The GeoDataFrame of matched wind turbines and eddy covariance towers.
         '''
 
-        if bounds:
-            bounds = np.array(bounds)
-            gdf_wind_wkg = gdf_wind.to_crs(crs).cx[bounds[0]:bounds[2], bounds[1]:bounds[3]].copy()
-            gdf_ec_wkg = gdf_ec.to_crs(crs).cx[bounds[0]:bounds[2], bounds[1]:bounds[3]].copy()
-        else:
-            gdf_wind_wkg = gdf_wind.to_crs(crs).copy()
-            gdf_ec_wkg = gdf_ec.to_crs(crs).copy()
-
+        # check for required columns
         if site_id_col not in gdf_ec.columns:
             raise ValueError(f"gdf_ec must contain a '{site_id_col}' column with the tower site IDs.")
+        if min_height is not None and height_col not in gdf_ec.columns:
+            raise ValueError(f"gdf_ec must contain a '{height_col}' column with the tower heights.")
+
+        gdf_wind = gdf_wind.to_crs(crs).copy()
+        gdf_ec = gdf_ec.to_crs(crs).copy()
+
+        # slice by time and space
+        if date is not None:
+            gdf_wind = gdf_wind.loc[(gdf_wind['start_year'] <= date.year) & (gdf_wind['retired_year'] >= date.year)]
+            gdf_ec = gdf_ec.loc[(gdf_ec['first_year'] <= date.year) & (gdf_ec['last_year'] >= date.year)]
+
+        if bounds:
+            bounds = np.array(bounds)
+            gdf_wind = gdf_wind.cx[bounds[0]:bounds[2], bounds[1]:bounds[3]]
+            gdf_ec = gdf_ec.cx[bounds[0]:bounds[2], bounds[1]:bounds[3]]
 
         if min_height is not None:
-            if height_col not in gdf_ec.columns:
-                raise ValueError(f"gdf_ec must contain a '{height_col}' column with the tower heights.")
-
-            gdf_ec_grouped = gdf_ec_wkg.dissolve(
+            gdf_ec_grouped = gdf_ec.dissolve(
                 by = site_id_col, aggfunc = None, 
                 **{
-                    'height_max': (height_col, 'max'), 
-                    'height_min': (height_col, 'min'), 
-                    'n_sensors': (site_id_col, 'count'),
-                    'sensor_heights': (height_col, lambda x: list(x))
+                    'eddy_height_max': (height_col, 'max'), 
+                    'eddy_height_min': (height_col, 'min'), 
+                    'eddy_n_sensors': (site_id_col, 'count'),
+                    'eddy_sensor_heights': (height_col, lambda x: list(x)),
+                    'eddy_first_year': ('first_year', 'min'),
+                    'eddy_last_year': ('last_year', 'max')
                 }
             )
-            gdf_ec_grouped['geometry_eddy'] = gdf_ec_grouped['geometry']
-            gdf_ec_grouped = gdf_ec_grouped[gdf_ec_grouped['height_min'] >= min_height]
-            gdf_nbrs = gdf_wind_wkg[['project_name', 'phase_name', 'capacity_mw', 'geometry', 'start_year', 'retired_year', 'project']].sjoin_nearest(
-                gdf_ec_grouped[['height_max', 'height_min', 'n_sensors', 'geometry_eddy', 'geometry']],
-                how = 'left', distance_col = 'dist_m',
-                max_distance = max_match_dist
-            )
-            del gdf_ec_grouped
         else:
-            gdf_ec_grouped = gdf_ec_wkg.dissolve(
+            gdf_ec_grouped = gdf_ec.dissolve(
                 by = site_id_col, aggfunc = None,
                 **{
-                    'n_sensors': (site_id_col, 'count'),
+                    'eddy_n_sensors': (site_id_col, 'count'),
+                    'eddy_first_year': ('first_year', 'min'),
+                    'eddy_last_year': ('last_year', 'max')
                 }
             )
-            gdf_ec_grouped['geometry_eddy'] = gdf_ec_grouped['geometry']
-            gdf_nbrs = gdf_wind_wkg[['project_name', 'phase_name', 'capacity_mw', 'geometry', 'start_year', 'retired_year', 'project']].sjoin_nearest(
-                gdf_ec_grouped[['n_sensors', 'geometry_eddy', 'geometry']],
-                how = 'inner', distance_col = 'dist_m',
-                max_distance = max_match_dist
-            )
-            del gdf_ec_grouped
 
-        first_cols = ['project_name', 'phase_name', 'capacity_mw', site_id_col, 'dist_m']
+        gdf_ec_grouped['eddy_geometry'] = gdf_ec_grouped['geometry']
+        wind_cols = ['project', 'capacity_mw', 'start_year', 'retired_year', 'project_name', 'phase_name', 'installation_type', 'status', 'location_accuracy', 'geometry']
+        gdf_nbrs = gdf_wind[
+            wind_cols
+        ].rename(columns={col: f'wind_{col}' for col in wind_cols if col != 'geometry'}).sjoin_nearest(
+            gdf_ec_grouped,
+            how = 'inner', distance_col = 'dist_m',
+            max_distance = max_match_dist
+        )
+        del gdf_ec_grouped  # free memory
+
+        gdf_nbrs['wind_ec_overlap'] = gdf_nbrs.apply(
+            lambda row: max(0, min(row['wind_retired_year'], row['eddy_last_year']) - max(row['wind_start_year'], row['eddy_first_year'])),
+            axis = 1
+        ).astype(bool)
+
+        if only_overlap:
+            gdf_nbrs = gdf_nbrs.loc[gdf_nbrs['wind_ec_overlap']]
+
+        first_cols = ['wind_project', site_id_col, 'dist_m', 'wind_capacity_mw', 'wind_start_year', 'wind_retired_year', 'eddy_first_year', 'eddy_last_year', 'wind_ec_overlap']
         other_cols = [col for col in gdf_nbrs.columns if col not in first_cols]
         gdf_nbrs = gdf_nbrs[first_cols + other_cols]
 
         # TODO: time alignment of wind turbine operation and EC tower measurement periods
         #gdf_nbrs = gdf_nbrs.join(gdf_ameriflux_badm[['FLUX_MEASUREMENTS_DATE_START', 'FLUX_MEASUREMENTS_DATE_END']], on = site_id_col)
 
-        return gdf_nbrs
+        return gdf_nbrs.sort_values(by = 'dist_m')
 
     return (wind_ec_matches,)
 
@@ -266,6 +297,7 @@ def _(GDF_STATES, LineString, ScaleBar, folium, gpd, np, pd, plt):
             alpha: float = 0.5, 
             figsize = (7, 5),
             bounds: tuple|None = None,
+            scale_bar: bool = True,
             **kwargs
         ):
         '''
@@ -307,6 +339,8 @@ def _(GDF_STATES, LineString, ScaleBar, folium, gpd, np, pd, plt):
         bounds : tuple, optional
             Bounds of the plot in the form (minx, miny, maxx, maxy). If None (default), the bounds are determined from the matched points. 
             Padding is applied if specified.
+        scale_bar : bool, optional
+            If True, add a scale bar to the plot. Defaults to True.
         **kwargs
             Additional keyword arguments to pass to the plotting functions.
 
@@ -336,7 +370,7 @@ def _(GDF_STATES, LineString, ScaleBar, folium, gpd, np, pd, plt):
             markersize = marker_size_wind, alpha = alpha, 
             marker = marker_wind, linewidth = marker_width_wind
         )
-        gdf_matches.set_geometry('geometry_eddy').loc[height_ind].to_crs(crs).plot(  # eddy covariance
+        gdf_matches.set_geometry('eddy_geometry').loc[height_ind].to_crs(crs).plot(  # eddy covariance
             color = colour_ec, 
             ax = ax, 
             legend = False, 
@@ -347,7 +381,7 @@ def _(GDF_STATES, LineString, ScaleBar, folium, gpd, np, pd, plt):
         gdf_borders.to_crs(crs).plot(ax=ax, facecolor = 'None', linewidth = 0.25, autolim = False, zorder = 0)
 
         # lines
-        gdf_matches.loc[height_ind].apply(lambda row: LineString([row['geometry'].centroid, row['geometry_eddy'].centroid]) if not pd.isnull(row[['geometry_eddy', 'geometry']].values).any() else None, axis = 1).plot(
+        gdf_matches.loc[height_ind].apply(lambda row: LineString([row['geometry'].centroid, row['eddy_geometry'].centroid]) if not pd.isnull(row[['eddy_geometry', 'geometry']].values).any() else None, axis = 1).plot(
             linewidth = 0.1, color = 'grey',
             ax = ax
         )
@@ -355,15 +389,16 @@ def _(GDF_STATES, LineString, ScaleBar, folium, gpd, np, pd, plt):
         ax.set_ylim(bounds[1], bounds[3])
         ax.legend(
             ['Wind Farm', 'EC Tower'],
-            loc = 'lower right',
-            #loc = 'best',
+            #loc = 'lower right',
+            loc = 'best',
             markerscale = 1,
             fontsize = 10,
             frameon = True,
             fancybox = True,
             framealpha = 0.5,
         )
-        ax.add_artist(ScaleBar(1))  # add scale bar to give a gauge of distance
+        if scale_bar:
+            ax.add_artist(ScaleBar(1))  # add scale bar to give a gauge of distance
         ax.set_axis_off()
 
         return ax
@@ -451,8 +486,8 @@ def _(GDF_STATES, LineString, ScaleBar, folium, gpd, np, pd, plt):
 
         # the cols we actually have
         actual_cols_rename = {col: desired_cols_rename[col] for col in desired_cols_rename if col in gdf_matches.columns}
-    
-        gdf_matches.set_geometry('geometry_eddy').to_crs(crs).rename(
+
+        gdf_matches.set_geometry('eddy_geometry').to_crs(crs).rename(
             columns=actual_cols_rename
         ).explore(
             m = m,
@@ -469,7 +504,7 @@ def _(GDF_STATES, LineString, ScaleBar, folium, gpd, np, pd, plt):
         )
 
         geom_lat_lon = gdf_matches['geometry'].to_crs(crs)
-        geom_af_lat_lon = gdf_matches['geometry_eddy'].to_crs(crs)
+        geom_af_lat_lon = gdf_matches['eddy_geometry'].to_crs(crs)
 
         # create lines between tubines and nearest towers
         for i in range(len(gdf_matches)):
@@ -497,20 +532,42 @@ def _(GDF_STATES, LineString, ScaleBar, folium, gpd, np, pd, plt):
 
 
 
-    return plot_wind_ec_matches, plot_wind_ec_matches_folium
+    return (plot_wind_ec_matches,)
 
 
 @app.cell
-def _(gdf_matches, os, plot_wind_ec_matches_folium, xyz):
-    provider = xyz.Stadia.StamenTerrain(api_key=os.getenv('STADIA_API_KEY'))
-    provider["url"] = provider["url"] + f"?api_key={os.getenv('STADIA_API_KEY')}"
+def _(
+    GDF_COUNTRIES,
+    gdf_fluxnet,
+    gdf_wind,
+    mo,
+    plot_wind_ec_matches,
+    wind_ec_matches,
+):
+    match_dist = 20_000  # m
 
-    _m = plot_wind_ec_matches_folium(
-        gdf_matches.loc[gdf_matches['site_id'].str.startswith('UK')], 
-        tiles = provider
+
+    gdf_matches = wind_ec_matches(
+        gdf_wind, gdf_fluxnet, 
+        max_match_dist = match_dist,  # m
+        only_overlap = True
     )
-    _m.show_in_browser()
-    return
+
+    _ax = plot_wind_ec_matches(
+        gdf_matches,
+        pad = 500000,
+        gdf_borders = GDF_COUNTRIES,
+        scale_bar = False
+    )
+
+
+    mo.vstack([
+        mo.md(f'### Wind Turbine to EC Tower Matches (max distance = {match_dist/1000:.0f} km)'),
+        _ax,
+        # gdf_matches,
+        (gdf_matches['dist_m'] / 1000).rename('dist_km').describe().round(1).to_frame().T[['count', 'mean', '50%', 'min', 'max']].convert_dtypes()
+    ], align = 'center')
+    return (gdf_matches,)
 
 
 @app.cell
@@ -520,41 +577,50 @@ def _(gdf_matches):
 
 
 @app.cell
-def _(gdf_fluxnet, gdf_wind, mo, plot_wind_ec_matches, wind_ec_matches):
-    gdf_matches = wind_ec_matches(gdf_wind, gdf_fluxnet, max_match_dist = 1000_000, site_id_col = 'site_id').sort_values('dist_m')
-
-    _ax = plot_wind_ec_matches(gdf_matches.loc[gdf_matches['site_id'].str.startswith('UK-')], pad = 50000, marker_wind = 'None')
-
-
-    mo.vstack([
-        _ax,
-        (gdf_matches['dist_m'] / 1000).rename('dist_km').describe()
-    ], align = 'center')
-    return (gdf_matches,)
-
-
-@app.cell
-def _(gdf_matches):
-    gdf_matches.loc[gdf_matches['dist_m'] <= 100_000]
+def _(gdf_matches, gdf_wind):
+    gdf_wind.loc[gdf_wind['project'].isin(gdf_matches['wind_project'])]
     return
 
 
 @app.cell
-def _(gdf_fluxnet, gdf_matches):
-    _site_dists = gdf_matches.groupby('site_id').agg(
-        n_wind_turbines = ('Project Name', 'count'),
-        min_dist_m = ('dist_m', 'min'),
-        max_dist_m = ('dist_m', 'max'),
-    ).sort_values('min_dist_m')
+def _(gdf_matches):
+    gdf_matches.loc[gdf_matches['site_id'].str.startswith('DE-')]['wind_project'].unique().tolist()
+    return
 
-    gdf_fluxnet.join(_site_dists, on = 'site_id').sort_values('min_dist_m')
+
+@app.cell
+async def _(eddy, gdf_matches):
+    site_files = await eddy.data.flux.get_fluxnet_site_dirs(
+        gdf_matches['site_id'].unique().tolist(), 
+    )
+
+    fs_ruc = site_files['DE-RuC']
+    fs_hai = site_files['DE-Hai']
+    fs_myb = site_files['US-Myb']
+    fs_hdn = site_files['DE-Hdn']
+    fs_wjs = site_files['US-Wjs']
+    fs_rum = site_files['DE-RuM']
+    return (fs_ruc,)
+
+
+@app.cell
+def _(fs_ruc):
+    fs_ruc.fluxmet()
     return
 
 
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    ### 2. How close are offset sites to wind turbines
+    ### 2. How close are wind turbines to offset sites?
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    [Definitions for Woodland Carbon Code RAG ratings](https://www.woodlandcarboncode.org.uk/4-verification#:~:text=units%2E-,Green)
     """)
     return
 
@@ -564,10 +630,10 @@ def _(GDF_COUNTRIES, UK_BBOX, eddy, gdf_wind, plt):
     gdf_offset_uk = eddy.data.offset.load_offset_uk()
 
     _fig, _ax = plt.subplots(figsize=(10, 10))
-    gdf_offset_uk.plot(facecolor='green', ax = _ax)
-    gdf_wind.plot(ax = _ax, color = 'blue', markersize = 10, alpha = 0.5, marker = '1', linewidth = 0.25)
+    gdf_offset_uk.to_crs(eddy.PLOTTING_CRS).plot(facecolor='green', ax = _ax)
+    gdf_wind.to_crs(eddy.PLOTTING_CRS).plot(ax = _ax, color = 'blue', markersize = 10, alpha = 0.5, marker = '1', linewidth = 0.25)
 
-    GDF_COUNTRIES.plot(ax=_ax, linewidth=0.25, facecolor='None')
+    GDF_COUNTRIES.to_crs(eddy.PLOTTING_CRS).plot(ax=_ax, linewidth=0.25, facecolor='None')
     _ax.set_axis_off()
     _ax.set_xlim(UK_BBOX['min_lon'], UK_BBOX['max_lon'])
     _ax.set_ylim(UK_BBOX['min_lat'], UK_BBOX['max_lat'])
@@ -576,13 +642,15 @@ def _(GDF_COUNTRIES, UK_BBOX, eddy, gdf_wind, plt):
 
 
 @app.cell
-def _(gpd, np):
+def _(gpd, np, pd):
     def wind_offset_matches(
-            gdf_wind: gpd.GeoDataFrame, gdf_offset: gpd.GeoDataFrame,
+            gdf_wind: gpd.GeoDataFrame, 
+            gdf_offset: gpd.GeoDataFrame,
             *,
-            max_match_dist: int = 100_000, 
             crs: str = 'EPSG:3857',
-            bounds: tuple|None = None
+            bounds: tuple|None = None,
+            date: pd.Timestamp|None = None,
+            max_match_dist: int = 100_000, 
         ):
         '''
         Match wind turbines to their nearest carbon offset project location.
@@ -593,14 +661,18 @@ def _(gpd, np):
             GeoDataFrame containing wind turbine locations.
         gdf_offset : geopandas.GeoDataFrame
             GeoDataFrame containing carbon offset project locations.
-        max_match_dist : int, optional
-            Maximum distance (in meters) to consider a wind turbine as a match for a carbon offset project. Defaults to 100,000 m.
         crs : str, optional
             Coordinate reference system to use for matching. Defaults to 'EPSG:3857' (Web Mercator).
             Should be a projected CRS (e.g., UTM) to ensure accurate distance calculations.
         bounds : tuple, optional
             Bounds to apply to the matching in the form (minx, miny, maxx, maxy). If None (default), all turbines and projects are considered. 
             If specified, only turbines and projects within the bounds are considered.
+        date : pd.Timestamp, optional
+            Date to filter wind turbines and carbon offset projects by their operational status.
+        max_match_dist : int, optional
+            Maximum distance (in meters) to consider a wind turbine as a match for a carbon offset project. Defaults to 100,000 m.
+
+
 
         Returns
         -------
@@ -608,17 +680,19 @@ def _(gpd, np):
             The GeoDataFrame of matched wind turbines and carbon offset projects.
         '''
 
-        if bounds:
+        gdf_wind = gdf_wind.to_crs(crs).copy()
+        gdf_offset = gdf_offset.to_crs(crs).copy()
+        if date is not None:
+            gdf_wind = gdf_wind.loc[(gdf_wind['start_year'] <= date.year) & (gdf_wind['retired_year'] >= date.year)]
+            gdf_offset = gdf_offset.loc[(gdf_offset['start_date'] <= date)]
+        if bounds is not None:
             bounds = np.array(bounds)
-            gdf_wind_wkg = gdf_wind.to_crs(crs).cx[bounds[0]:bounds[2], bounds[1]:bounds[3]].copy()
-            gdf_offset_wkg = gdf_offset.to_crs(crs).cx[bounds[0]:bounds[2], bounds[1]:bounds[3]].copy()
+            gdf_wind = gdf_wind.cx[bounds[0]:bounds[2], bounds[1]:bounds[3]].copy()
+            gdf_offset = gdf_offset.cx[bounds[0]:bounds[2], bounds[1]:bounds[3]].copy()
         else:
-            gdf_wind_wkg = gdf_wind.to_crs(crs).copy()
-            gdf_offset_wkg = gdf_offset.to_crs(crs).copy()
-
-            gdf_offset_wkg['geometry_offset'] = gdf_offset_wkg['geometry']
-            gdf_nbrs = gdf_wind_wkg[['Project Name', 'Phase Name', 'Capacity (MW)', 'geometry', 'Start year', 'Retired year', 'project']].sjoin_nearest(
-                gdf_offset_wkg,
+            gdf_offset['geometry_offset'] = gdf_offset['geometry']
+            gdf_nbrs = gdf_wind[['Project Name', 'Phase Name', 'Capacity (MW)', 'geometry', 'Start year', 'Retired year', 'project']].sjoin_nearest(
+                gdf_offset,
                 how = 'inner', distance_col = 'dist_m',
                 max_distance = max_match_dist
             )
@@ -630,7 +704,7 @@ def _(gpd, np):
         return gdf_nbrs
 
 
-    return (wind_offset_matches,)
+    return
 
 
 @app.cell
@@ -702,7 +776,7 @@ def _(LineString, folium, gpd, nearest_points, pd):
         _stats = _gdf.groupby('project_id', observed=True).agg(
             n_turbines=('dist_m', 'size'),
             nearest_turbine_km=('dist_m', lambda _s: round(_s.min() / 1000, 2)),
-            capacity_mw=('Capacity (MW)', 'sum')
+            capacity_mw=('capacity_mw', 'sum')
         )
 
         # ---- base layer
@@ -750,11 +824,11 @@ def _(LineString, folium, gpd, nearest_points, pd):
 
         # ---- wind turbines (markers)
         _wind_cols = {
-            'Project Name': 'Turbine Project',
-            'Phase Name': 'Phase',
-            'Capacity (MW)': 'Capacity (MW)',
-            'Start year': 'Start year',
-            'Retired year': 'Retired year',
+            'project_name': 'Turbine Project',
+            'phase_name': 'Phase',
+            'capacity_mw': 'Capacity (MW)',
+            'start_year': 'Start year',
+            'retired_year': 'Retired year',
             'project_name': 'Nearest Offset Project',
             'class': 'Nearest Offset Class',
             'subclass': 'Nearest Offset Subclass'
@@ -802,20 +876,38 @@ def _(LineString, folium, gpd, nearest_points, pd):
 
 
 
-    return (plot_wind_offset_folium,)
+    return
 
 
 @app.cell
-def _(gdf_offset_uk, gdf_wind, wind_offset_matches):
-    gdf_wo_matches = wind_offset_matches(gdf_wind, gdf_offset_uk, max_match_dist = 100_000).sort_values('dist_m')
+def _(eddy, gdf_offset_uk, gdf_wind):
+    gdf_wo_matches = eddy.offset.wind_offset_matches(gdf_wind, gdf_offset_uk, max_match_dist = 10_000).sort_values('dist_m')
     gdf_wo_matches
     return (gdf_wo_matches,)
 
 
 @app.cell
-def _(GDF_COUNTRIES, gdf_wo_matches, plot_wind_offset_folium):
-    m_wo = plot_wind_offset_folium(gdf_wo_matches, gdf_base = GDF_COUNTRIES, simplify_m = 25)
+def _(eddy, gdf_wo_matches):
+    m_wo = eddy.offset.plot_wind_offset_folium(
+        gdf_wo_matches, gdf_base = None, simplify_m = 25,
+        colour_wind = 'lightblue'
+    )
     m_wo.show_in_browser()
+    return
+
+
+@app.cell
+def _(eddy, folium, gdf_wind):
+    _m = gdf_wind.to_crs(eddy.PLOTTING_CRS).explore(
+     tiles = eddy.util.BASEMAP_DEFAULT
+    )
+    # plot a site at 50.797400664303844, 0.13260808955314488
+    _m.add_child(folium.Marker(
+        location = [50.797400664303844, 0.13260808955314488],
+        popup = 'winery',
+        icon = folium.Icon(color = 'red', icon = 'wine-glass', prefix = 'fa')
+    ))
+    _m.show_in_browser()
     return
 
 
@@ -948,8 +1040,504 @@ def _(mo):
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    Theoretically, maybe though this may be due to more noise in the data than signal
+    Can compare to CWEX data - custom built for measurement of wind wakes using EC.
+
+    Blog: https://wiki.ucar.edu/pages/viewrecentblogposts.action?key=cwex11
+
+    Wind farm:
+    - Story County wind farm, Phase 1
+        - De/re-commissioned in 2019.
     """)
+    return
+
+
+@app.cell
+def _(Dataset, mo):
+    _info_accordion = {}
+    _ds_test = Dataset('/Users/hugoneely/Documents/4-work/1-current/PhD/repos/eddy-cov/data/flux/NCAR/CWEX/cwex_20110816_20.nc')
+
+    for _var_name, _var in _ds_test.variables.items():
+        _long_name = getattr(_var, "long_name", "")
+        _key = f'**{_var_name}**{("- " + _long_name) if _long_name else ""}'
+
+
+        _info_accordion[_key] = {
+            'dtype': _var.dtype,
+            'shape': str(_var.shape) if _var.shape else '',
+            'dimensions': str(_var.dimensions) if _var.dimensions else '',
+            'units': getattr(_var, "units", ""),
+        }
+    mo.accordion(_info_accordion, multiple = True)
+    return
+
+
+@app.cell
+def _(Dataset, Literal, Path):
+    def var_n_stations(ds: Dataset, var_name: str|None = None) -> int|dict:
+        """
+        Get a dictionary mapping variable names to the number of stations they have in the dataset.
+
+        Parameters
+        ----------
+        ds : netCDF4.Dataset
+            The netCDF dataset to inspect.
+        var_name : str or None
+            The name of the variable to get the number of stations for. If None, returns a dictionary with all variables.
+
+        Returns
+        -------
+        int or dict
+            If a specific variable name is provided, returns the number of stations for that variable.
+            Otherwise, returns a dictionary where keys are variable names and values are the number of stations for that variable.
+            If a variable does not have a 'station' dimension, its value will be 0.
+        """
+        if var_name is not None:
+            if var_name not in ds.variables:
+                raise ValueError(f"Variable name '{var_name}' not found in dataset variables: {list(ds.variables.keys() - ds.dimensions.keys())}.")
+            if 'station' in ds.variables[var_name].dimensions:
+                return ds.dimensions['station'].size
+            else:
+                return 0
+    
+        n_stations = {}
+        for var_ in ds.variables:
+            if 'station' in ds.variables[var_].dimensions:
+                n_stations[var_] = ds.dimensions['station'].size
+            else:
+                n_stations[var_] = 0
+        return n_stations
+
+    def var_n_samples(ds: Dataset, var_name: str|None = None) -> int|dict:
+        """
+        Get a dictionary mapping variable names to the number of samples they have in the dataset.
+
+        Parameters
+        ----------
+        ds : netCDF4.Dataset
+            The netCDF dataset to inspect.
+        var_name : str or None
+            The name of the variable to get the number of samples for. If None, returns a dictionary with all variables.
+
+        Returns
+        -------
+        int or dict
+            If a specific variable name is provided, returns the number of samples for that variable.
+            Otherwise, returns a dictionary where keys are variable names and values are the number of samples for that variable.
+            If a variable does not have a 'sample' dimension, its value will be 0.
+        """
+        if var_name is not None:
+            if var_name not in ds.variables:
+                raise ValueError(f"Variable name '{var_name}' not found in dataset variables: {list(ds.variables.keys() - ds.dimensions.keys())}.")
+            if 'sample' in ds.variables[var_name].dimensions:
+                return ds.dimensions['sample'].size
+            else:
+                return 0
+
+        n_samples = {}
+        for var_name in ds.variables:
+            if 'sample' in ds.variables[var_name].dimensions:
+                n_samples[var_name] = ds.dimensions['sample'].size
+            else:
+                n_samples[var_name] = 0
+        return n_samples
+
+    def var_metadata(ds: Dataset, var_name: str|None = None) -> dict:
+        """
+        Get the metadata for a variable in the dataset.
+
+        Parameters
+        ----------
+        ds : netCDF4.Dataset
+            The netCDF dataset to inspect.
+        var_name : str or None
+            The name of the variable to get the metadata for. If None (default), returns 
+            metadata for all variables in the dataset.
+
+        Returns
+        -------
+        dict
+            A dictionary containing the metadata for the variable(s), 
+            including its dimensions, shape, data type, and any attributes.
+        """
+        if var_name is not None and var_name not in ds.variables:
+            raise ValueError(f"Variable name '{var_name}' not found in dataset variables: {list(ds.variables.keys() - ds.dimensions.keys())}.")
+
+        if var_name is None:
+            metadata = {}
+            for var in ds.variables:
+                metadata[var] = var_metadata(ds, var)
+            return metadata
+    
+        var = ds.variables[var_name]
+        metadata = {
+            'dimensions': var.dimensions,
+            'shape': var.shape,
+            'dtype': var.dtype,
+            'is_dimension': var_name in ds.dimensions,
+            'attributes': {attr: getattr(var, attr) for attr in var.ncattrs()}
+        }
+        return metadata
+
+    def smallest_ds(dir_path: Path, return_type: Literal['path', 'contents'] = 'contents') -> Path|Dataset:
+        """
+        Find the smallest netCDF dataset in a directory based on file size.
+
+        Parameters
+        ----------
+        dir_path : Path
+            The path to the directory containing netCDF files.
+        return_type : Literal['path', 'contents'], optional
+            The type of the returned value. If 'path', returns the path to the smallest netCDF file.
+            If 'contents', returns the contents of the smallest netCDF file as a Dataset.
+
+        Returns
+        -------
+        Path or Dataset
+            The path to the smallest netCDF file in the directory, or its contents as a Dataset, 
+            depending on the `return_type` parameter.
+        """
+        nc_files = list(dir_path.glob('*.nc'))
+        if not nc_files:
+            raise FileNotFoundError(f"No netCDF files found in directory: {dir_path}")
+    
+        smallest_file = min(nc_files, key=lambda f: f.stat().st_size)
+        if return_type == 'contents':
+            return Dataset(smallest_file)
+        else:
+            return smallest_file
+
+    return smallest_ds, var_metadata
+
+
+@app.cell
+def _(Dataset, Literal, Path, np, pathlib, pd):
+    def get_timeseries(
+            ds: Dataset,
+            var_name: str,
+            *,
+            sample: int|Literal['all'] = 'all',
+            station: int|Literal['NCAR1', 'NCAR2', 'NCAR3', 'NCAR4', 'all'] = 'all',
+            return_type: Literal['masked_array', 'data_with_nan', 'mask'] = 'data_with_nan',
+        ):
+        '''
+        Get a time series of a variable from a netCDF dataset.
+
+        Parameters
+        ----------
+        ds : netCDF4.Dataset
+            The netCDF dataset to extract the time series from.
+        var_name : str
+            The name of the variable to extract. Must be a variable in the dataset.
+        sample : int or 'all', optional
+            The sample index to extract. If 'all', all samples will be extracted. Defaults to 0.
+        station : int or str, optional
+            The station index or name to extract. 
+            If an integer, it is used as the index into the station dimension of the variable.
+            If a string, it must be one of 'NCAR1', 'NCAR2', 'NCAR3', 'NCAR4', or 'all'.
+            If 'all', all stations will be extracted. Defaults to 'NCAR1'.
+            Integer indices as 1-based, so passing 1 is equivalent to passing 'NCAR1'.
+        return_type : str, optional
+            The type of the returned time series. Must be one of 'masked_array', 'data_with_nan', or 'mask'.
+            Defaults to 'data_with_nan'.
+
+
+        Returns
+        -------
+        numpy.masked_array
+            The time series of the specified variable for the specified sample and station.
+            Shape depends on if 'all' is specified for sample or station. If 'all' is specified for both, the shape will be (time, station, sample).
+        '''
+
+        if var_name in ds.dimensions:
+            raise ValueError(f"Variable name '{var_name}' is a dimension in the dataset, not a variable.")
+        if var_name not in ds.variables:
+            raise ValueError(f"Variable name '{var_name}' not found in dataset variables: {list(ds.variables.keys() - ds.dimensions.keys())}.")
+
+        if 'time' not in ds.variables[var_name].dimensions:
+            raise ValueError(f"Cannot make a timeseries for variable '{var_name}' because it does not have a 'time' dimension. Its dimensions are: {ds.variables[var_name].dimensions}.")
+
+        if isinstance(station, str) and station != 'all':
+            station_map = {
+                'NCAR1': 1,
+                'NCAR2': 2,
+                'NCAR3': 3,
+                'NCAR4': 4
+            }
+            if station not in station_map:
+                raise ValueError(f"Invalid station name '{station}'. Must be one of {list(station_map.keys())}.")
+            station_index = station_map[station] - 1  # convert to 0-based index
+        elif isinstance(station, int):
+            station_index = station - 1  # convert to 0-based index
+        elif station == 'all':
+            station_index = slice(None)  # select all stations
+        else:
+            raise TypeError(f"Station must be an int or str, got {type(station)}.")
+
+        if isinstance(station_index, int) and (station_index < 0 or station_index >= ds.dimensions['station'].size):
+            raise IndexError(f"Station index {station_index + 1} is out of bounds for dimension 'station' with size {ds.dimensions['station'].size}.")
+
+        if isinstance(sample, int) and (sample < 0 or sample >= ds.dimensions['sample'].size):
+            raise IndexError(f"Sample index {sample} is out of bounds for dimension 'sample' with size {ds.dimensions['sample'].size}.")
+        elif sample == 'all':
+            sample = slice(None)  # select all samples
+
+        # determine which indexers we need to use based on the variable's dimensions
+        indexers = []
+        for dim in ds.variables[var_name].dimensions:
+            if dim == 'time':
+                indexers.append(slice(None))  # select all time steps
+            elif dim == 'station':
+                indexers.append(station_index)
+            elif dim == 'sample':
+                indexers.append(sample)
+
+        return_type = return_type.lower()
+        if return_type == 'masked_array':
+            return ds[var_name][tuple(indexers)]
+        elif return_type == 'mask':
+            return ds[var_name][tuple(indexers)].mask
+        elif return_type == 'data_with_nan':
+            return ds[var_name][tuple(indexers)].filled(np.nan)
+        else:
+            raise ValueError(f"Invalid return_type '{return_type}'. Must be one of 'masked_array', 'data_with_nan', or 'mask'.")
+
+    def get_all_timeseries(
+            dir_path: Path,
+            var_name: str,
+            *,
+            sample: int|Literal['all'] = 'all',
+            station: int|Literal['NCAR1', 'NCAR2', 'NCAR3', 'NCAR4', 'all'] = 'all',
+            return_type: Literal['masked_array', 'data_with_nan', 'mask'] = 'data_with_nan',
+            return_time: bool = False
+    ) -> tuple[np.ndarray, np.ndarray]|np.ndarray:
+        '''
+        Get the timeseries of a variable from all netCDF files in a directory.
+        Returns both the timestamps and the variable values as numpy arrays.
+
+        Parameters
+        ----------
+        dir_path : str or Path
+            Path to the directory containing the netCDF files.
+        var_name : str
+            The name of the variable to extract. Must be a variable in the dataset.
+        sample : int or 'all', optional
+            The sample index to extract (from 0 to 19). If 'all', all samples will be extracted. Defaults to 'all'.
+        station : int or str, optional
+            The station index or name to extract.
+            If an integer, it is used as the index into the station dimension of the variable.
+            If a string, it must be one of 'NCAR1', 'NCAR2', 'NCAR3', 'NCAR4', or 'all'.
+            If 'all', all stations will be extracted. Defaults to 'NCAR1'.
+            Integer indices are 1-based, so passing 'NCAR1' is equivalent to passing 1.
+        return_type : str, optional
+            The type of the returned time series. Must be one of 'masked_array', 'data_with_nan', or 'mask'.
+            Defaults to 'data_with_nan'.
+        return_time : bool, optional
+            Whether to return the timestamps corresponding to the variable values. Defaults to True.
+
+        Returns
+        -------
+        numpy.ndarray, numpy.ndarray
+            A tuple containing two numpy arrays, containing:
+            1. The timestamps corresponding to the variable values.
+            2. The variable values for the specified sample and station.
+        or np.ndarray
+            If return_time is True, returns a tuple of two numpy arrays as described above.
+            If return_time is False, returns only the variable values as a single numpy array.
+        '''
+
+        if return_time:
+            out_time = np.array([], dtype='datetime64[ns]')
+        out_var = np.array([], dtype=np.float32)  # all CWEX timeseries are float32
+
+        is_first = True  # create output arrays from first output, to ensure shape is correct
+        for file_path in sorted(pathlib.Path(dir_path).glob('*.nc')):
+            if return_time:
+                # filenames in format cwex_YYYYMMDD_HH.nc
+                date_str = file_path.stem.split('_')[1]
+                hr_str = file_path.stem.split('_')[2]
+                start_time = pd.to_datetime(date_str + hr_str, format='%Y%m%d%H').to_datetime64()
+
+            ds = Dataset(file_path)
+            if return_time:
+                new_time = start_time + (ds['time'][:] * 1000).astype('timedelta64[ms]')  # [ms] conversion required as some time values are half-seconds
+            new_var = get_timeseries(ds, var_name=var_name, sample=sample, station=station, return_type=return_type)
+        
+
+            if is_first:  # create
+                is_first = False
+                if return_time:
+                    out_time = new_time
+                out_var = new_var
+            else:  # append
+                if return_time:
+                    out_time = np.append(out_time, new_time, axis=0)
+                out_var = np.append(out_var, new_var, axis=0)
+
+        if return_time:
+            return out_time, out_var
+        else:
+            return out_var
+
+    def get_all_time(dir_path: Path) -> np.ndarray:
+        """
+        Get the time values from all netCDF files in a directory.
+
+        Parameters
+        ----------
+        dir_path : Path
+            Path to the directory containing the netCDF files.
+
+        Returns
+        -------
+        np.ndarray
+            A numpy array containing the time values from all netCDF files in the directory.
+        """
+        out_time = np.array([], dtype='datetime64[ns]')
+
+        for file_path in sorted(pathlib.Path(dir_path).glob('*.nc')):
+            # filenames in format cwex_YYYYMMDD_HH.nc
+            date_str = file_path.stem.split('_')[1]
+            hr_str = file_path.stem.split('_')[2]
+            start_time = pd.to_datetime(date_str + hr_str, format='%Y%m%d%H').to_datetime64()
+
+            ds = Dataset(file_path)
+            out_time = np.append(out_time, start_time + (ds['time'][:] * 1000).astype('timedelta64[ms]'), axis=0)
+
+        return out_time
+
+    return get_all_time, get_all_timeseries
+
+
+@app.cell
+def _(FLUX_DIR, smallest_ds, var_metadata):
+    CWEX_DIR = FLUX_DIR / 'NCAR' / 'CWEX'
+
+    cwex_metadata = var_metadata(smallest_ds(CWEX_DIR), var_name=None)
+    return CWEX_DIR, cwex_metadata
+
+
+@app.cell
+def _(CWEX_DIR, cwex_metadata, get_all_timeseries, plt):
+    _co2_times, _co2_data = get_all_timeseries(
+        CWEX_DIR,
+        var_name = 'co2_4_5m',
+        return_type = 'data_with_nan',
+        return_time = True,
+        sample = 0,
+        station = 'NCAR1'
+    )
+
+    _fig, _ax = plt.subplots(figsize=(10, 3))
+
+    _ax.scatter(
+        _co2_times, _co2_data, 
+        marker = '.', s = 1, alpha = 0.5,
+        linewidth = 0.25, color = 'tab:green'
+    )
+    _ax.set_xlabel('Time')
+    _ax.set_ylabel(f'[CO$_2$] / ${cwex_metadata["co2_4_5m"]["attributes"]["units"]}$')
+    _ax.tick_params(axis = 'x', rotation = 90)
+    _ax.grid()
+
+    _ax
+    return
+
+
+@app.cell
+def _(Literal, Path, get_all_timeseries, np):
+    def get_TKE(
+            dir_path: Path,
+            station: int|Literal['NCAR1', 'NCAR2', 'NCAR3', 'NCAR4', 'all'] = 'all',
+        ) -> np.ndarray:
+        '''
+        Calculate the Turbulent Kinetic Energy (TKE) from the wind velocity components.
+        TKE is estimated as 0.5 * (var(u) + var(v) + var(w)), where var(u), var(v), and var(w) are the variances of the 
+        wind velocity in the x, y, and z directions, respectively.
+
+        Parameters
+        ----------
+        dir_path : Path
+            Path to the directory containing the netCDF files.
+        station : int or str, optional
+            The station index or name to extract.
+            If an integer, it is used as the index into the station dimension of the variable.
+            If a string, it must be one of 'NCAR1', 'NCAR2', 'NCAR3', 'NCAR4', or 'all'.
+            If 'all', all stations will be extracted. Defaults to 'all'.
+
+        Returns
+        -------
+        np.ndarray
+            A numpy array containing the TKE values for the specified station(s) across all time steps.
+        '''
+
+        is_first = True  # create output arrays from first output, to ensure shape is correct
+        for var_name in ['u_4_5m', 'v_4_5m', 'w_4_5m']:
+            velocity_component = get_all_timeseries(
+                dir_path,
+                var_name=var_name,
+                return_type='data_with_nan',
+                return_time=False,
+                sample='all',
+                station=station
+            )
+            if is_first:
+                is_first = False
+                out = np.nanvar(velocity_component, axis = 1, ddof=1)  # variance across samples for each time step and station
+            else:
+                out += np.nanvar(velocity_component, axis = 1, ddof=1)
+        return 0.5 * out  # TKE = 0.5 * (u'^2 + v'^2 + w'^2)
+
+    return (get_TKE,)
+
+
+@app.cell
+def _(CWEX_DIR, get_TKE, get_all_time):
+    t = get_all_time(CWEX_DIR)
+    tke = get_TKE(CWEX_DIR, station = 'all')
+    return t, tke
+
+
+@app.cell
+def _(np, plt, t, tke):
+    _fig, _ax = plt.subplots(4,1, figsize=(10, 12), sharex=True)
+
+    _colours = ['tab:blue', 'tab:orange', 'tab:green', 'tab:red']
+
+    for _i in range(4):
+        _ax[_i].scatter(
+            t, tke[:, _i],
+            marker = '.', s = 1, alpha = 0.5,
+            linewidth = 0.25, color = _colours[_i]
+        )
+
+        # fill with grey where data is nan
+        _ax[_i].fill_between(
+            t, 0, 1, where = np.isnan(tke[:, _i]),
+            color = 'lightgrey', alpha = 0.9, transform = _ax[_i].get_xaxis_transform()
+        )
+
+        _ax[_i].set_ylabel(f'TKE$_{{{_i+1}}}$ / m$^2$ s$^{-2}$')
+        #_ax[_i].grid()
+        _ax[_i].set_title(f'NCAR{_i+1}')
+        _ax[_i].set_xlim(t[0], t[-1])
+
+    _ax[-1].set_xlabel('Time')
+    _ax[-1].tick_params(axis = 'x', rotation = 45)
+    
+
+    _fig
+    return
+
+
+@app.cell
+def _(CWEX_DIR, gpd, pd):
+    gdf_cwex = pd.concat([
+        gpd.read_file(CWEX_DIR / 'cwex_ncar.kml')[['Name', 'geometry']],  # from NCAR CWEX KML file
+        gpd.read_file(CWEX_DIR / 'cwex_turbines.kml')[['Name', 'geometry']]  # from own google earth mapping 
+    ]).rename(columns = {'Name': 'id'}).set_index('id').sort_index()
+    gdf_cwex.index = gdf_cwex.index.str.lower()
+    gdf_cwex['type'] = gdf_cwex.index.map(lambda x: 'eddy tower' if x.startswith('ncar') else 'wind turbine').astype('category')
+    gdf_cwex
     return
 
 
@@ -979,713 +1567,6 @@ def _(mo):
 
 @app.cell
 def _():
-    return
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    # Archive code - to be sorted into headings above
-    """)
-    return
-
-
-@app.cell
-def _(FLUX_DIR, gpd, pd):
-    _cols = ['FLUX_MEASUREMENTS_DATE_START', 'FLUX_MEASUREMENTS_DATE_END', 'LOCATION_DATE_START', 'LOCATION_COMMENT', 'LOCATION_LAT', 'LOCATION_LONG', 'LOCATION_ELEV']
-    # read only the values we want from the flat-structured excel file
-    df_ameriflux_badm = pd.read_excel(
-        FLUX_DIR / 'AmeriFlux' / 'AMF_AA-Flx_BIF_CCBY4_20260527.xlsx', 
-        usecols = ['SITE_ID', 'VARIABLE', 'DATAVALUE']
-    ).loc[lambda _df: _df['VARIABLE'].isin(_cols)]
-
-    df_ameriflux_badm = df_ameriflux_badm.pivot_table(index = 'SITE_ID', columns = 'VARIABLE', values = 'DATAVALUE', aggfunc = 'first')  # pivot to non-flat format
-    df_ameriflux_badm = df_ameriflux_badm[_cols]  # re-order
-
-    gdf_ameriflux_badm = gpd.GeoDataFrame(df_ameriflux_badm, geometry = gpd.points_from_xy(df_ameriflux_badm['LOCATION_LONG'], df_ameriflux_badm['LOCATION_LAT']))
-    gdf_ameriflux_badm.set_crs('EPSG:4326', inplace = True)
-    del df_ameriflux_badm
-    gdf_ameriflux_badm
-    return (gdf_ameriflux_badm,)
-
-
-@app.cell
-def _(FLUX_DIR, gdf_ameriflux_badm, gpd, pd):
-    #df_ameriflux = pd.read_excel(FLUX_DIR / 'AmeriFlux' / 'AMF_AA-Flx_BIF_CCBY4_20260527.xlsx')
-    df_ameriflux = pd.read_csv(FLUX_DIR / 'AmeriFlux' / 'BASE_MeasurementHeight_20260527.csv')
-    df_ameriflux['var_base'] = df_ameriflux['Variable'].str.split('(_\d)+', regex=True).apply(lambda x: x[0])
-
-    df_ameriflux = df_ameriflux.join(
-        pd.read_csv(FLUX_DIR / 'AmeriFlux' / 'flux-met_processing_variables_20260618.csv', index_col = 1), on = 'var_base'
-    ).sort_values(['Site_ID', 'Variable'])
-    df_ameriflux = df_ameriflux.loc[df_ameriflux['Type'] == 'MET_WIND']
-    gdf_ameriflux = gpd.GeoDataFrame(df_ameriflux.join(gdf_ameriflux_badm[['geometry', 'FLUX_MEASUREMENTS_DATE_START', 'FLUX_MEASUREMENTS_DATE_END']], on = 'Site_ID').sort_values(['Site_ID', 'Variable'])).reset_index(drop = True)
-    gdf_ameriflux.set_crs('EPSG:4326', inplace = True)
-    del df_ameriflux
-    gdf_ameriflux
-    return (gdf_ameriflux,)
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    ## Wind-EC matching
-    """)
-    return
-
-
-@app.cell
-def _(GDF_STATES, folium, pd):
-    def plot_nearest_turbines_folium(
-            gdf_nbrs, *, 
-            colour_wind = 'blue', colour_ec = 'green', marker_size_wind = 100, marker_width_wind = 0.75, marker_size_ec = 25, alpha = 0.5
-    ):
-
-        m = GDF_STATES.explore(color = 'None', style_kwds = {'color': 'black', 'weight': 0.5}, tiles = 'CartoDB positron', tooltip = False)
-        gdf_nbrs.rename(
-            columns={
-                'site_id': 'Neighbour Site ID', 
-                'dist_m': 'Dist to EC Neighbour (m)'
-            }
-        ).explore(
-            m = m, 
-            color = colour_wind, 
-            marker_type = folium.Marker(
-                icon = folium.Icon(color = 'blue', icon = 'wind', prefix = 'fa')
-            ), 
-            marker_kwds = {
-                'radius': marker_size_wind/10, 
-                'weight': marker_width_wind, 
-                'fill_opacity': alpha
-            }, 
-            tooltip = ['Project Name', 'Capacity (MW)', 'Dist to EC Neighbour (m)', 'Neighbour Site ID', 'Start year', 'Retired year']
-        )
-
-        gdf_nbrs.set_geometry('geometry_eddy').rename(
-            columns={
-                'Site_ID': 'Site ID',
-                'FLUX_MEASUREMENTS_DATE_START': 'EC Measurements Start',
-                'FLUX_MEASUREMENTS_DATE_END': 'EC Measurements End',
-                'height_max': 'Max Height',
-                'height_min': 'Min Height',
-                'n_sensors': 'Number of Sensors'
-            }
-        ).explore(
-            m = m,
-            color = colour_ec,
-            marker_type = folium.Marker(
-                icon = folium.Icon(color = 'green', icon = 'tower-broadcast', prefix = 'fa')
-            ),
-            marker_kwds = {
-                'radius': marker_size_ec/10, 
-                'weight': 0.5, 
-                'fill_opacity': alpha
-            },
-            tooltip = ['Site ID', 'Max Height', 'Min Height', 'Number of Sensors', 'EC Measurements Start', 'EC Measurements End']
-        )
-
-        _geom_lat_lon = gdf_nbrs['geometry'].to_crs(epsg = 4326)
-        _geom_af_lat_lon = gdf_nbrs['geometry_eddy'].to_crs(epsg = 4326)
-
-        for _i in range(len(gdf_nbrs)):
-            _geom = _geom_lat_lon.iloc[_i]
-            _geom_af = _geom_af_lat_lon.iloc[_i]
-            if pd.isna([_geom_af, _geom]).any():
-                # skip if either geometry is NaN
-                continue
-
-            _dist = gdf_nbrs['dist_m'].iloc[_i] / 1000
-
-            _locs = [
-                [_geom.y, _geom.x], 
-                [_geom_af.y, _geom_af.x]
-            ]
-            _line = folium.PolyLine(
-                locations = _locs,
-                color = 'grey', weight = 10,
-                #dash_array = '6',
-                opacity = 0.25,
-                tooltip = f'{_dist:.1f} km'
-            )
-            _line.add_to(m)
-        return m
-
-    #m = plot_nearest_turbines_folium(gdf_nbrs.loc[gdf_nbrs['Site_ID'] == 'US-PFa'], colour_wind = 'blue', colour_ec = 'green', marker_size_wind = 100, marker_width_wind = 0.75, marker_size_ec = 25, alpha = 0.5)
-    #m.show_in_browser()
-    return
-
-
-@app.cell
-def _(OUT_DIR, m):
-    m.save(OUT_DIR / 'wind-ec-neighbouurs-ameriflux.html')
-    return
-
-
-@app.cell
-def _(
-    GDF_STATES,
-    colour_ec,
-    colour_wind,
-    folium,
-    gdf_nbrs,
-    marker_size_ec,
-    marker_size_wind,
-    marker_width_wind,
-    pd,
-):
-    na_ind = gdf_nbrs[['geometry', 'geometry_eddy']].notna().all(axis = 1)
-    ALPHA = 0.5
-    _m = GDF_STATES.explore(color = 'None', style_kwds = {'color': 'black', 'weight': 0.5}, tiles = 'CartoDB positron', tooltip = False)
-    gdf_nbrs[na_ind].rename(
-        columns={
-            'Site_ID': 'Neighbour Site ID', 
-            'dist_m': 'Dist to EC Neighbour (m)'
-        }
-    ).explore(
-        m = _m, 
-        color = colour_wind, 
-        marker_type = folium.Marker(
-            icon = folium.Icon(color = 'blue', icon = 'wind', prefix = 'fa')
-        ), 
-        marker_kwds = {
-            'radius': marker_size_wind/10, 
-            'weight': marker_width_wind, 
-            'fill_opacity': ALPHA
-        }, 
-        tooltip = ['Project Name', 'Capacity (MW)', 'Dist to EC Neighbour (m)', 'Neighbour Site ID', 'Start year', 'Retired year']
-    )
-
-    gdf_nbrs[na_ind].set_geometry('geometry_eddy').rename(
-        columns={
-            'Site_ID': 'Site ID',
-            'FLUX_MEASUREMENTS_DATE_START': 'EC Measurements Start',
-            'FLUX_MEASUREMENTS_DATE_END': 'EC Measurements End'
-        }
-    ).explore(
-        m = _m,
-        color = colour_ec,
-        marker_type = folium.Marker(
-            icon = folium.Icon(color = 'green', icon = 'tower-broadcast', prefix = 'fa')
-        ),
-        marker_kwds = {
-            'radius': marker_size_ec/10, 
-            'weight': 0.5, 
-            'fill_opacity': ALPHA
-        },
-        tooltip = ['Site ID', 'Height', 'EC Measurements Start', 'EC Measurements End']
-    )
-
-    _geom_lat_lon = gdf_nbrs.loc[na_ind, 'geometry'].to_crs(epsg = 4326)
-    _geom_af_lat_lon = gdf_nbrs.loc[na_ind, 'geometry_eddy'].to_crs(epsg = 4326)
-
-    for _i in range(na_ind.sum()):
-        _geom = _geom_lat_lon.iloc[_i]
-        _geom_af = _geom_af_lat_lon.iloc[_i]
-        if pd.isna([_geom_af, _geom]).any():
-            continue
-        _locs = [
-            [_geom.y, _geom.x], 
-            [_geom_af.y, _geom_af.x]
-        ]
-        _line = folium.PolyLine(
-            locations = _locs,
-            color = 'grey', weight = 2,
-            dash_array = '3',
-            opacity = 0.5
-        )
-        _line.add_to(_m)
-
-    _m.show_in_browser()
-    return
-
-
-@app.cell
-def _(gdf_wind):
-    gdf_wind.loc[gdf_wind['Project Name'] == 'JD wind farm']
-    return
-
-
-@app.cell
-def _(gdf_nbrs):
-    gdf_nbrs.groupby('Site_ID').agg(
-        **{
-            'height': ('Height', 'first'),
-            'n_turbines': ('project', 'nunique'),
-            'mean_dist_m': ('dist_m', 'mean'),
-            'min_dist_m': ('dist_m', 'min'),
-            'max_dist_m': ('dist_m', 'max'),
-        }
-    )
-    return
-
-
-@app.cell
-def _(gdf_nbrs):
-    gdf_nbrs.loc[gdf_nbrs['Site_ID'].notna(), 'Site_ID'].value_counts()
-    return
-
-
-@app.cell
-def _(gdf_nbrs):
-    gdf_nbrs
-    return
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    ## Measurement heights
-    """)
-    return
-
-
-@app.cell
-def _(gdf_ameriflux):
-    gdf_ameriflux.plot.box(column = 'Height', by = 'var_base', figsize = (8,15), vert = False, grid = True).values[0]
-    return
-
-
-@app.cell
-def _(gdf_ameriflux):
-    gdf_ameriflux.loc[gdf_ameriflux['height_max'] > 75]
-    return
-
-
-@app.cell
-def _(GDF_COUNTRIES, gdf_ameriflux):
-    _ax = gdf_ameriflux.loc[gdf_ameriflux['height_max'] > 5].dissolve(by = 'Site_ID', aggfunc = {'Height': 'max'}).plot(
-        column = 'Height',
-        color = 'red',
-        #cmap = 'Reds',
-        legend = True,
-        #legend_kwds = {'label': "Maximum Measurement Height (m)", 'orientation': "horizontal"},
-        figsize = (10, 20),
-        markersize = 'Height',
-        alpha = 0.1
-    )
-    GDF_COUNTRIES.plot(ax=_ax, facecolor = 'None', linewidth = 0.25)
-    _ax.set_axis_off()
-    _bounds = gdf_ameriflux.total_bounds
-    _pad = 0.1
-    _ax.set_xbound(_bounds[0] - _pad * (_bounds[2] - _bounds[0]), _bounds[2] + _pad * (_bounds[2] - _bounds[0]))
-    _ax.set_ybound(_bounds[1] - _pad * (_bounds[3] - _bounds[1]), _bounds[3] + _pad * (_bounds[3] - _bounds[1]))
-    _ax
-    return
-
-
-@app.cell
-def _(GDF_COUNTRIES, gdf_ameriflux, plt):
-
-
-    _bounds = gdf_ameriflux.total_bounds
-    _heights = [0, 10, 25, 50, 75]
-
-    _fig, _axs = plt.subplots(1, len(_heights), figsize = (4 * len(_heights), 10))
-
-
-    _total_towers = len(gdf_ameriflux.dissolve(by = 'Site_ID', aggfunc = {'Height': 'max'}))
-
-    for _i, _ax in enumerate(_axs):
-        _n_towers = len(gdf_ameriflux.loc[gdf_ameriflux['height_max'] > _heights[_i]].dissolve(by = 'Site_ID', aggfunc = {'Height': 'max'}))
-
-        gdf_ameriflux.loc[gdf_ameriflux['height_max'] > _heights[_i]].dissolve(by = 'Site_ID', aggfunc = {'Height': 'max'}).plot(
-            column = 'Height',
-            color = 'red',
-            #cmap = 'Reds',
-            legend = True,
-            #legend_kwds = {'label': "Maximum Measurement Height (m)", 'orientation': "horizontal"},
-            figsize = (10, 20),
-            markersize = 1,
-            alpha = 0.3,
-            ax = _ax
-        )
-        GDF_COUNTRIES.plot(ax=_ax, facecolor = 'None', linewidth = 0.25)
-        _ax.set_axis_off()
-        _pad = 0.1
-        _ax.set_xbound(_bounds[0] - _pad * (_bounds[2] - _bounds[0]), _bounds[2] + _pad * (_bounds[2] - _bounds[0]))
-        _ax.set_ybound(_bounds[1] - _pad * (_bounds[3] - _bounds[1]), _bounds[3] + _pad * (_bounds[3] - _bounds[1]))
-        _ax.set_title(f'Max Height > {_heights[_i]} m\n{_n_towers} / {_total_towers} towers', fontsize = 12)
-    _fig
-    return
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    ## Spatial distribution of EC towers
-    """)
-    return
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    ### AmeriFlux
-    """)
-    return
-
-
-@app.cell
-def _(GDF_COUNTRIES, box, gdf_ameriflux, gpd, np, plt):
-    # grid data
-    DEFAULT_AGGS = {
-        'H_mean': ('Height', 'mean'),
-        'H_std': ('Height', 'std'),
-        'H_max': ('Height', 'max'),
-        'H_median': ('Height', 'median'),
-        'H_min': ('Height', 'min'),
-        'H_count': ('Height', 'count'),
-        'sites': ('Site_ID', 'nunique')
-    }
-
-    def grid_data(gdf: gpd.GeoDataFrame, n_cells: int = 65, aggs: dict = DEFAULT_AGGS):
-        for agg_name, (col, func) in aggs.items():
-            if col not in gdf.columns:
-                raise ValueError(f"Column {col} is not a valid column for aggregation. Must be one the columns in gdf - see gdf.columns.")
-
-        xmin, ymin, xmax, ymax = gdf.total_bounds
-
-        cell_size = (xmax - xmin) / n_cells
-
-        grid_cells = []
-        for x0 in np.arange(xmin, xmax + cell_size, cell_size):
-            for y0 in np.arange(ymin, ymax + cell_size, cell_size):
-                x1 = x0 + cell_size
-                y1 = y0 + cell_size
-                grid_cells.append(box(x0, y0, x1, y1))
-
-
-        return gpd.GeoDataFrame(
-            gpd.GeoDataFrame(grid_cells, columns=['geometry'], crs = gdf.crs).sjoin(
-                gdf, 
-                how = 'left', 
-                predicate = 'contains'
-            ).groupby(
-                by = 'geometry'
-            ).agg(**aggs).reset_index(),
-            crs = gdf.crs
-        )
-
-    def plot_grid_data(
-        gdf: gpd.GeoDataFrame, col: str, 
-        *, 
-        cmap: str = None, legend_label: str = None, legend_kwds: dict = None,
-        ax = None, bounds = None, pad = 0.1, 
-        plot_coastline = True, **plot_kwargs
-    ):
-        if col not in gdf.columns:
-            raise ValueError(f"Column {col} is not a valid column for plotting. Must be one the columns in gdf - see gdf.columns.")
-        if bounds is None:
-            bounds = gdf.total_bounds
-        if pad > 0:
-            bounds[0] -= pad * (bounds[2] - bounds[0])
-            bounds[1] -= pad * (bounds[3] - bounds[1])
-            bounds[2] += pad * (bounds[2] - bounds[0])
-            bounds[3] += pad * (bounds[3] - bounds[1])
-
-        if legend_kwds:
-            legend_kwds = {**{'label': legend_label, 'orientation': "horizontal", 'shrink': 0.6}, **legend_kwds}
-        else:
-            legend_kwds = {'label': legend_label, 'orientation': "horizontal"}
-
-        if ax is None:
-            fig, ax = plt.subplots(figsize = (10, 10))
-
-        plot_kwargs = {**{'legend': True, 'edgecolor': 'k', 'linewidth': 0.4}, **plot_kwargs}
-        gdf.plot(
-            column = col,
-            cmap = cmap,
-            legend_kwds = legend_kwds,
-            ax = ax,
-            **plot_kwargs
-        )
-        if plot_coastline:
-            GDF_COUNTRIES.plot(ax=ax, facecolor = 'None', edgecolor = 'k', alpha = 0.5, linewidth = 0.25)
-        ax.set_axis_off()
-        ax.set_xbound(bounds[0], bounds[2])
-        ax.set_ybound(bounds[1], bounds[3])
-        return ax
-
-
-
-    _n_cells = 65
-    gdf_ameriflux_cells = grid_data(gdf_ameriflux, n_cells = _n_cells, aggs = DEFAULT_AGGS)#.replace({0: np.nan})
-
-    # plot :)
-    _fig, (_ax1, _ax2) = plt.subplots(1,2, figsize = (20,10))
-
-    plot_grid_data(
-        gdf_ameriflux_cells.replace({0: np.nan}), 
-        col = 'sites', 
-        cmap = 'Greens',
-        legend_label = "N Sites",
-        ax = _ax1,
-    )
-    plot_grid_data(
-        gdf_ameriflux_cells.replace({0: np.nan}), 
-        col = 'H_max', 
-        cmap = 'Purples',
-        legend_label = "Max. Measurement Height (m)",
-        ax = _ax2,
-    )
-    _bnds = gdf_ameriflux_cells.total_bounds
-    _cell_size = (_bnds[2] - _bnds[0]) / _n_cells
-    _fig.suptitle('Gridded AmeriFlux Tower Data', fontsize = 16)
-    _fig.text(0.5, 0.93, rf'Cell Size: ${_cell_size:.2f}°\times{_cell_size:.2f}° \approx {_cell_size * 111:.2f} km \times {_cell_size * 111:.2f}km$', ha='center', fontsize = 12)
-    _ax1.set_title('Number of Sites per Grid Cell', fontsize = 12)
-    _ax2.set_title('Maximum Measurement Height (m)', fontsize = 12)
-    _fig
-    return grid_data, plot_grid_data
-
-
-@app.cell
-def _(gdf):
-    gdf
-    return
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    ### FLUXNET
-    """)
-    return
-
-
-@app.cell
-def _(gdf_fluxnet, grid_data, np, plot_grid_data, plt):
-    _n_cells = 300
-    gdf_fluxnet_cells = grid_data(
-        gdf_fluxnet, 
-        n_cells = _n_cells,
-        aggs = {
-            'sites': ('site_id', 'nunique'),
-            'source': ('data_hub', 'first')
-        }
-    ).replace({0: np.nan})
-
-    _fig, _ax = plt.subplots(figsize = (15, 10))
-    plot_grid_data(
-        gdf_fluxnet_cells,
-        col = 'sites',
-        cmap = 'Greens',
-        legend_label = "N Sites", legend_kwds = {'shrink': 0.6},
-        ax = _ax,
-        linewidth = 0.2, 
-    )
-
-    _bnds = gdf_fluxnet_cells.total_bounds
-    _cell_size = (_bnds[2] - _bnds[0]) / _n_cells
-    _fig.suptitle('Gridded FLUXNET Tower Data', fontsize = 16)
-    _fig.text(0.5, 0.93, rf'Cell Size: ${_cell_size:.2f}°\times{_cell_size:.2f}° \approx {_cell_size * 111:.2f} km \times {_cell_size * 111:.2f}km$', ha='center', fontsize = 12)
-    _ax.set_title('Number of Sites per Grid Cell', fontsize = 12)
-    return (gdf_fluxnet_cells,)
-
-
-@app.cell
-def _(Point, folium, gdf_fluxnet_cells):
-    def get_width_and_length(geom):
-        coords = list(geom.exterior.coords)
-
-        # Distance between first two points (Width)
-        width = Point(coords[0]).distance(Point(coords[1]))
-        # Distance between second and third points (Length)
-        length = Point(coords[1]).distance(Point(coords[2]))
-        return min(width, length), max(width, length)
-    _dimensions = gdf_fluxnet_cells.to_crs(epsg = 3857).geometry.apply(get_width_and_length)
-
-    gdf_fluxnet_cells["approx_width_km"], gdf_fluxnet_cells["approx_length_km"] = zip(*_dimensions)
-    gdf_fluxnet_cells[['approx_width_km', 'approx_length_km']] = gdf_fluxnet_cells[['approx_width_km', 'approx_length_km']] / 1000
-
-    gdf_fluxnet_cells['approx_area_km2'] = gdf_fluxnet_cells.to_crs(epsg = 3857).area / 1000000
-
-
-    _m = folium.Map(location = [0, 0], zoom_start = 2, tiles = 'CartoDB positron', control_scale = True)
-    folium.GeoJson(
-        gdf_fluxnet_cells.loc[gdf_fluxnet_cells['sites'] > 0],
-        tooltip = folium.GeoJsonTooltip(fields = ['sites', 'source', 'approx_area_km2', 'approx_width_km', 'approx_length_km'], aliases = ['N Sites', 'Data Hub', 'Approximate Area (km²)', 'Approximate Width (km)', 'Approximate Length (km)'], localize = True)
-    ).add_to(_m)
-    _m.show_in_browser()
-    return
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    ## Number of sensors per tower
-    """)
-    return
-
-
-@app.cell
-def _(gdf_ameriflux):
-    gdf_ameriflux
-    return
-
-
-@app.cell
-def _(gdf_ameriflux):
-    list(gdf_ameriflux.loc[(gdf_ameriflux['Site_ID'] == 'AR-Bal') & (gdf_ameriflux['var_base'] == 'WD'), 'Instrument_Model'].unique())
-    return
-
-
-@app.cell
-def _(gdf_ameriflux, gpd):
-    gdf_af_sensors = gpd.GeoDataFrame(
-        gdf_ameriflux.groupby(['Site_ID', 'var_base']).agg(
-            {
-                'Variable':'count', 
-                'Description': 'first', 
-                'Height': lambda x: x.to_list(), 
-                'Instrument_Model': lambda x: x.to_list(),
-                'Units':'first',
-                'geometry': 'first'
-            }
-        ).rename(columns = {'Variable': 'n_sensors', 'Description': 'desc', 'Height': 'heights', 'Units': 'units', 'Instrument_Model': 'instruments'}).reset_index()
-    )
-    gdf_af_sensors['instruments_n_unique'] = gdf_af_sensors['instruments'].apply(lambda x: len(set(x)))
-    gdf_af_sensors['heights_n_unique'] = gdf_af_sensors['heights'].apply(lambda x: len(set(x)))
-
-    gdf_af_sensors
-    return (gdf_af_sensors,)
-
-
-@app.cell
-def _(gdf_af_sensors):
-    _ax = gdf_af_sensors.loc[gdf_af_sensors['var_base'] == 'WS', 'n_sensors'].hist(bins = 20)
-    _ax.set_xlabel('N. Wind Sensors')
-    _ax.set_ylabel('Freq.')
-    _ax.set_xticks(range(0, gdf_af_sensors.loc[gdf_af_sensors['var_base'] == 'WS', 'n_sensors'].max() + 1))
-    _ax.set_title('Distribution of Number of Wind Sensors per AmeriFlux Site')
-    return
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    ## Wind extrapolation
-    """)
-    return
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    ---
-    todo:
-      - method for determining the validity of each extrapolation method
-        - Determine conditions for each tower
-      - site-independent ML extrapolation?
-        - read more!
-    ---
-
-    To extrapolate I need to:
-    1. Determine validity of methods:
-        - Terrain type
-            - LiDAR?
-            - Satellite?
-            - Manual, from description?
-                - Worst, most tiring, and least rigorous option.
-        - Time of available data (some methods depend upon prior years data)
-    2. Determine availability of parameters
-        - Some require
-
-    Before I extrapolate, I'd like to understand:
-    - How useful would extrapolated EC wind speeds be? Specifically, for:
-        - Climate models
-        - Weather prediction
-        - Wind turbines
-            - Could turbines be built near to EC towers?
-                - Does this go completely counter to what EC towers are used for? Would this be removing the land-management scheme, and instead replacing it with an industrial project?
-                    - I guess the argument for my thesis would be that its a hedging scheme for land management schemes, and makes them more attractive to business.
-                    - Is there an amount of time after which an EC tower's measurements are effectively redundant? Does CO2 sequestration stabilise? My imagining would be for certain forest types maybe? And only on certain time scales (at which the forest can be seen as approximately constant)
-        - Wildfire prediction?
-            - Better understanding of natural disasters could be highly beneficial for land management schemes in high-risk areas
-                - Need understanding of:
-                    - what a high-risk area is
-                    - if land management schemes are likely to be here (or near here)
-            - Would this improve the fine-grained prediction of disaster management?
-    - How EC data is already used!
-        - Am I assuming they're in a silo, but really they're the swiss-army pens of atmospheric science that it seems they could be?
-        - Are they used in:
-            - Reanalysis datasets
-            - NWP
-            - Wind speed datasets
-    """)
-    return
-
-
-@app.cell
-def _(np, pd):
-    def instrument_option(ws_measurement_heights: list, target_height_m: float = 80, strict: bool = False) -> int:
-        '''
-        Determine the instrument option, as defined in Gaulieri (2019).
-
-        1. A single anemometer at a single (lower) height.
-        2. Two anemometers at a single (lower) height.
-        3. One lower anemometer, and one at the target height.
-
-        Parameters
-        ----------
-        ws_measurement_heights : list
-            List of wind speed measurement heights (in meters).
-        target_height_m : float, optional
-            Target height for wind speed measurement (default is 80 m).
-        strict : bool, optional
-            If True, only return option 3 if there is an anemometer exactly at the target height. If False, return option 3 if there is an anemometer at or above the target height.
-
-        Returns
-        -------
-        int
-            Instrument option (1, 2, or 3) based on the provided measurement heights, or 0 if no heights are available.
-        '''
-        if pd.isna(ws_measurement_heights).all() or not ws_measurement_heights:
-            return 0
-
-        unique_heights = set(ws_measurement_heights)
-        unique_heights.discard(np.nan)  # Remove NaN values if present - should be at least 1 value left after this, per the above return 0 check
-        unique_heights.discard(None) 
-        unique_heights.discard(pd.NA)
-
-
-        if len(ws_measurement_heights) == 1:
-            return 1
-        elif len(ws_measurement_heights) >= 2:
-            if len(unique_heights) == 1:
-                return 2
-
-            if strict:
-                if target_height_m in ws_measurement_heights:
-                    return 3
-                else:
-                    return 2
-            else:
-                if (target_height_m <= np.array(ws_measurement_heights)).any():
-                    return 3
-                else:
-                    return 2
-        else:
-            return 0
-
-    return (instrument_option,)
-
-
-@app.cell
-def _(gdf_af_sensors, instrument_option):
-    gdf_af_sensors['instrument_option'] = gdf_af_sensors.apply(lambda row: instrument_option(row['heights'], target_height_m = 80, strict = False) if row['var_base'] == 'WS' else None, axis = 1)
-    gdf_af_sensors
-    return
-
-
-@app.cell
-def _(gdf_af_sensors):
-    gdf_af_sensors.loc[(gdf_af_sensors['var_base'] == 'WS') & (gdf_af_sensors['geometry'].notna()), 'instrument_option'].value_counts().sort_index()
-    return
-
-
-@app.cell
-def _(gdf_af_sensors):
-    gdf_af_sensors.loc[gdf_af_sensors['instrument_option'] == 3]
     return
 
 
