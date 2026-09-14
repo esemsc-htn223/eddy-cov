@@ -1,10 +1,11 @@
 import geopandas as gpd
+import pandas as pd
 import requests
 
 from eddy.util import DATA_DIR
 from eddy.data.common import standardise_df
 
-OFFSET_DIR = DATA_DIR / 'offsets'
+OFFSET_DIR = DATA_DIR / 'offset'
 if not OFFSET_DIR.exists():
     OFFSET_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -52,6 +53,9 @@ def load_offset_uk(*, force_download: bool = False) -> gpd.GeoDataFrame:
     gdf[['Country', 'Project_status', 'RAG_Status']] = gdf[['Country', 'Project_status', 'RAG_Status']].astype('category')
     gdf.convert_dtypes()
     gdf[['Class', 'Sub_Class']] = gdf[['Class', 'Sub_Class']].astype('int8')
+    gdf['Year_5_Ver_Due_Date'] = pd.to_datetime(gdf['Year_5_Ver_Due_Date'], errors='coerce', format = '%a, %d %b %Y %H:%M:%S GMT')
+    gdf['Year_15_Ver_Due_Date'] = pd.to_datetime(gdf['Year_15_Ver_Due_Date'], errors='coerce', format = '%a, %d %b %Y %H:%M:%S GMT')
+    gdf['start_date'] = gdf['Year_5_Ver_Due_Date'] - pd.Timedelta(days = 365*5)
 
     gdf = gdf.rename(columns={col: col.lower() for col in gdf.columns})
     # swap class and class_name, and subclass and subclass_name
