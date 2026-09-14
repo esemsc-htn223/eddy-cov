@@ -1,19 +1,21 @@
 __all__ = [
     'DATA_DIR', 'OUT_DIR', 'LOG_DIR',
     'BASE_CRS', 'DISTANCE_CRS', 'PLOTTING_CRS',
-    'logger_data', 'logger_processing'
+    'logger_data', 'logger_processing',
+    'BASEMAP_DEFAULT'
 ]
 
 import os
 import pathlib
 import logging
+import xyzservices.providers as xyz
 
+# CRS
 BASE_CRS = 'EPSG:3857'  # Web Mercator projection for mapping and distance calculations (units in meters)
-#BASE_CRS = 'EPSG:4326'  # WGS 84 projection for mapping and distance calculations (units in degrees)
 DISTANCE_CRS = 'EPSG:3857'  # Web Mercator projection for distance calculations (units in meters)
 PLOTTING_CRS = 'EPSG:4326'  # WGS 84 projection for plotting (units in degrees)
 
-
+# Dirs
 DATA_DIR = pathlib.Path(__file__).parent.parent.parent / 'data'
 OUT_DIR = pathlib.Path(__file__).parent.parent.parent / 'out'
 LOG_DIR = pathlib.Path(__file__).parent.parent.parent / 'log'
@@ -23,6 +25,8 @@ for _dir in dirs:
     if not _dir.exists():
         os.makedirs(_dir)
 
+
+# Logging
 log_files = {
     'eddy_data': LOG_DIR / 'eddy-data.log',
     'eddy_processing': LOG_DIR / 'eddy-processing.log',
@@ -42,3 +46,8 @@ for logger, log_file in log_files.items():
 
 logger_data = logging.getLogger('eddy_data')
 logger_processing = logging.getLogger('eddy_processing')
+
+
+
+# Plotting
+BASEMAP_DEFAULT = xyz.CartoDB.Positron(api_key=os.getenv('CARTO_API_KEY', None))
