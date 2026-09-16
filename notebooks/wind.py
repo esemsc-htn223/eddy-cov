@@ -1098,7 +1098,7 @@ def _(Dataset, Literal, Path):
                 return ds.dimensions['station'].size
             else:
                 return 0
-    
+
         n_stations = {}
         for var_ in ds.variables:
             if 'station' in ds.variables[var_].dimensions:
@@ -1167,7 +1167,7 @@ def _(Dataset, Literal, Path):
             for var in ds.variables:
                 metadata[var] = var_metadata(ds, var)
             return metadata
-    
+
         var = ds.variables[var_name]
         metadata = {
             'dimensions': var.dimensions,
@@ -1199,7 +1199,7 @@ def _(Dataset, Literal, Path):
         nc_files = list(dir_path.glob('*.nc'))
         if not nc_files:
             raise FileNotFoundError(f"No netCDF files found in directory: {dir_path}")
-    
+
         smallest_file = min(nc_files, key=lambda f: f.stat().st_size)
         if return_type == 'contents':
             return Dataset(smallest_file)
@@ -1295,11 +1295,53 @@ def _(Dataset, Literal, Path, np, pathlib, pd):
         if return_type == 'masked_array':
             return ds[var_name][tuple(indexers)]
         elif return_type == 'mask':
-            return ds[var_name][tuple(indexers)].mask
+            # getmaskarray, not .mask, which collapses to a scalar False when nothing is masked
+            return np.ma.getmaskarray(ds[var_name][tuple(indexers)])
         elif return_type == 'data_with_nan':
             return ds[var_name][tuple(indexers)].filled(np.nan)
         else:
             raise ValueError(f"Invalid return_type '{return_type}'. Must be one of 'masked_array', 'data_with_nan', or 'mask'.")
+
+    def average_over_time(
+            time: np.ndarray, var: np.ndarray, period: np.timedelta64
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Average a timeseries over fixed-length, epoch-anchored time bins.
+
+        Parameters
+        ----------
+        time : np.ndarray
+            Timestamps for each row of `var`, in ascending order.
+        var : np.ndarray
+            Values to average. Only the leading (time) axis is reduced.
+        period : np.timedelta64
+            Length of each averaging bin.
+
+        Returns
+        -------
+        np.ndarray, np.ndarray
+            The start time of each bin, and the mean of `var` within it. Bins containing no valid
+            data are NaN (masked, if `var` is a masked array).
+        """
+
+        bin_index = (time.astype('datetime64[ns]').astype('int64')
+                     // period.astype('int64'))  # anchored on the Unix epoch
+        bin_starts, first_row = np.unique(bin_index, return_index=True)
+
+        was_masked = np.ma.isMaskedArray(var)
+        values = np.ma.filled(var, np.nan).astype(np.float64)
+
+        is_valid = ~np.isnan(values)
+        totals = np.add.reduceat(np.where(is_valid, values, 0.0), first_row, axis=0)
+        counts = np.add.reduceat(is_valid, first_row, axis=0)
+
+        with np.errstate(invalid='ignore'):
+            means = np.where(counts > 0, totals / counts, np.nan)
+
+        if was_masked:
+            means = np.ma.masked_invalid(means)
+
+        return bin_starts * period + np.datetime64(0, 'ns'), means
 
     def get_all_timeseries(
             dir_path: Path,
@@ -1308,7 +1350,10 @@ def _(Dataset, Literal, Path, np, pathlib, pd):
             sample: int|Literal['all'] = 'all',
             station: int|Literal['NCAR1', 'NCAR2', 'NCAR3', 'NCAR4', 'all'] = 'all',
             return_type: Literal['masked_array', 'data_with_nan', 'mask'] = 'data_with_nan',
-            return_time: bool = False
+            return_time: bool = False,
+            t_min: np.datetime64|None = None,
+            t_max: np.datetime64|None = None,
+            time_averaging: str|np.timedelta64|None = None
     ) -> tuple[np.ndarray, np.ndarray]|np.ndarray:
         '''
         Get the timeseries of a variable from all netCDF files in a directory.
@@ -1333,6 +1378,18 @@ def _(Dataset, Literal, Path, np, pathlib, pd):
             Defaults to 'data_with_nan'.
         return_time : bool, optional
             Whether to return the timestamps corresponding to the variable values. Defaults to True.
+        t_min : np.datetime64 or None, optional
+            Minimum timestamp to include in the output. If None, no minimum is applied. Defaults to None.
+        t_max : np.datetime64 or None, optional
+            Maximum timestamp to include in the output. If None, no maximum is applied. Defaults to None.
+        time_averaging : str or np.timedelta64 or None, optional
+            If given, average the output over fixed-length time bins, e.g. '30m', '1h' or
+            np.timedelta64(30, 'm'). Bins are anchored on the Unix epoch, so '30m' bins start on
+            the hour and half hour. Only the time axis is reduced; any sample and station axes are
+            kept. Averaging is arithmetic and NaN-aware, so u and v should be averaged separately
+            and the wind direction derived afterwards. A bin with no valid data comes back as NaN
+            (or masked), and the final bin may be incomplete. Not supported with
+            return_type='mask'. If None, no averaging is applied. Defaults to None.
 
         Returns
         -------
@@ -1349,29 +1406,79 @@ def _(Dataset, Literal, Path, np, pathlib, pd):
             out_time = np.array([], dtype='datetime64[ns]')
         out_var = np.array([], dtype=np.float32)  # all CWEX timeseries are float32
 
-        is_first = True  # create output arrays from first output, to ensure shape is correct
+        if t_min is not None and not isinstance(t_min, np.datetime64):
+            raise TypeError(f"t_min must be a numpy.datetime64 object or None, got {type(t_min)}.")
+        if t_max is not None and not isinstance(t_max, np.datetime64):
+            raise TypeError(f"t_max must be a numpy.datetime64 object or None, got {type(t_max)}.")
+        if t_min is not None and t_max is not None and t_min >= t_max:
+            raise ValueError(f"t_min ({t_min}) must be less than t_max ({t_max}).")
+
+        if time_averaging is not None:
+            if return_type.lower() == 'mask':
+                raise ValueError("time_averaging is not supported with return_type='mask'.")
+            averaging_period = np.timedelta64(pd.Timedelta(time_averaging)).astype('timedelta64[ns]')
+            if averaging_period <= np.timedelta64(0, 'ns'):
+                raise ValueError(f"time_averaging must be a positive duration, got {time_averaging}.")
+
+
+        time_chunks = []  # collected per file, concatenated once at the end
+        var_chunks = []
+        slice_time = t_min is not None or t_max is not None
+        # set defaults if not provided
+        if t_min is None:
+            t_min = np.datetime64('1970-01-01T00:00:00')
+        if t_max is None:
+            t_max = np.datetime64('2100-01-01T00:00:00')
+
+        time_index_relevant = False  # flag to indicate if the time index needs to be sliced for the current file
         for file_path in sorted(pathlib.Path(dir_path).glob('*.nc')):
-            if return_time:
-                # filenames in format cwex_YYYYMMDD_HH.nc
+            if return_time or slice_time:
+                # filenames in format cwex_YYYYMMDD_HH.nc - identify start datetime from this
                 date_str = file_path.stem.split('_')[1]
                 hr_str = file_path.stem.split('_')[2]
-                start_time = pd.to_datetime(date_str + hr_str, format='%Y%m%d%H').to_datetime64()
+                file_start_time = pd.to_datetime(date_str + hr_str, format='%Y%m%d%H').to_datetime64()
+                file_end_time = file_start_time + np.timedelta64(4, 'h')  # each file contains 4 hours of data
+
+                # Check if the file is relevant based on the time range
+                if t_min > file_end_time:  # skip if the entire file is before t_min - yet to reach relevant files
+                    #        [         ] |_  |^
+                    continue
+                elif t_max < file_start_time:  # break if the entire file is after t_max - we have exhausted relevant files
+                    # |_  |^ [         ]              
+                    break
+                elif t_min <= file_start_time and file_end_time <= t_max:
+                    # |_     [         ] |^
+                    time_index_relevant = False  # entire file is relevant - no slicing required
+                else:
+                    # |_     [    |^   ] 
+                    #        [  |_   |^] 
+                    #        [  |_     ] |^
+                    time_index_relevant = True  # some part of the file is relevant - slicing required
 
             ds = Dataset(file_path)
-            if return_time:
-                new_time = start_time + (ds['time'][:] * 1000).astype('timedelta64[ms]')  # [ms] conversion required as some time values are half-seconds
+            if return_time or time_index_relevant or time_averaging is not None:
+                new_time = file_start_time + (ds['time'][:] * 1000).astype('timedelta64[ms]')  # [ms] conversion required as some time values are half-seconds
             new_var = get_timeseries(ds, var_name=var_name, sample=sample, station=station, return_type=return_type)
-        
 
-            if is_first:  # create
-                is_first = False
-                if return_time:
-                    out_time = new_time
-                out_var = new_var
-            else:  # append
-                if return_time:
-                    out_time = np.append(out_time, new_time, axis=0)
-                out_var = np.append(out_var, new_var, axis=0)
+            if time_index_relevant:
+                mask = (new_time >= t_min) & (new_time <= t_max)
+                new_time = new_time[mask]
+                new_var = new_var[mask]
+
+
+            if return_time or time_averaging is not None:
+                time_chunks.append(new_time)
+            var_chunks.append(new_var)
+
+        if var_chunks:
+            # np.append/np.concatenate drop the mask, so masked arrays need np.ma.concatenate
+            concatenate = np.ma.concatenate if return_type.lower() == 'masked_array' else np.concatenate
+            out_var = concatenate(var_chunks, axis=0)
+            if return_time or time_averaging is not None:
+                out_time = np.ma.getdata(np.concatenate(time_chunks, axis=0))
+
+            if time_averaging is not None:
+                out_time, out_var = average_over_time(out_time, out_var, averaging_period)
 
         if return_time:
             return out_time, out_var
@@ -1413,34 +1520,7 @@ def _(FLUX_DIR, smallest_ds, var_metadata):
     CWEX_DIR = FLUX_DIR / 'NCAR' / 'CWEX'
 
     cwex_metadata = var_metadata(smallest_ds(CWEX_DIR), var_name=None)
-    return CWEX_DIR, cwex_metadata
-
-
-@app.cell
-def _(CWEX_DIR, cwex_metadata, get_all_timeseries, plt):
-    _co2_times, _co2_data = get_all_timeseries(
-        CWEX_DIR,
-        var_name = 'co2_4_5m',
-        return_type = 'data_with_nan',
-        return_time = True,
-        sample = 0,
-        station = 'NCAR1'
-    )
-
-    _fig, _ax = plt.subplots(figsize=(10, 3))
-
-    _ax.scatter(
-        _co2_times, _co2_data, 
-        marker = '.', s = 1, alpha = 0.5,
-        linewidth = 0.25, color = 'tab:green'
-    )
-    _ax.set_xlabel('Time')
-    _ax.set_ylabel(f'[CO$_2$] / ${cwex_metadata["co2_4_5m"]["attributes"]["units"]}$')
-    _ax.tick_params(axis = 'x', rotation = 90)
-    _ax.grid()
-
-    _ax
-    return
+    return (CWEX_DIR,)
 
 
 @app.cell
@@ -1523,7 +1603,7 @@ def _(np, plt, t, tke):
 
     _ax[-1].set_xlabel('Time')
     _ax[-1].tick_params(axis = 'x', rotation = 45)
-    
+
 
     _fig
     return
@@ -1538,6 +1618,161 @@ def _(CWEX_DIR, gpd, pd):
     gdf_cwex.index = gdf_cwex.index.str.lower()
     gdf_cwex['type'] = gdf_cwex.index.map(lambda x: 'eddy tower' if x.startswith('ncar') else 'wind turbine').astype('category')
     gdf_cwex
+    return
+
+
+@app.cell
+def _(np):
+    # deriving wind direction from the u and v components of the wind velocity, where u is the east-west component and v is the north-south component. 
+    # The wind direction can be calculated using the arctangent of the ratio of these two components. 
+    # The formula for wind direction in meteorology is typically given in degrees from true north, 
+    # with 0° indicating wind coming from the north, 90° from the east, 180° from the south, and 270° from the west.
+
+    def wind_direction(
+            u:np.ndarray, v:np.ndarray, *,
+            return_speed: bool = False
+        ) -> np.ndarray:
+        """
+        Calculate wind direction from u and v wind components.
+
+        Parameters
+        ----------
+        u : array-like
+            The east-west component of the wind velocity (positive values indicate wind from the west).
+        v : array-like
+            The north-south component of the wind velocity (positive values indicate wind from the south).
+        return_speed : bool, optional
+            If True, also return the wind speed. Defaults to False.
+
+        Returns
+        -------
+        numpy.ndarray
+            Wind direction in degrees from true north, where 0 indicates wind coming from the north,
+            pi/2 (90) from the east, pi (180) from the south, and 3*pi/2 (270) from the west.
+        If `return_speed` is True, returns a tuple of (wind_direction, wind_speed).
+        """
+        # calculate in radians
+        wind_dir_rad = np.arctan2(-u, -v)  # negative signs to convert to meteorological convention
+
+        if return_speed:
+            wind_speed = np.sqrt(u**2 + v**2)
+            return wind_dir_rad, wind_speed
+
+        return wind_dir_rad
+
+    return (wind_direction,)
+
+
+@app.cell
+def _(CWEX_DIR, get_all_timeseries, np, plt, wind_direction):
+    _tmin = np.datetime64('2011-07-02T00:00:00')
+    _tmax = np.datetime64('2011-08-17T00:00:00')
+
+    _u = get_all_timeseries(
+        CWEX_DIR,
+        var_name = 'U_10m',
+        sample = 'all',
+        station = 'all',
+        return_type = 'data_with_nan',
+        t_min = _tmin,
+        t_max = _tmax,
+        time_averaging = '30m'
+    )
+    _v = get_all_timeseries(
+        CWEX_DIR,
+        var_name = 'V_10m',
+        sample = 'all',
+        station = 'all',
+        return_type = 'data_with_nan',
+        t_min = _tmin,
+        t_max = _tmax,
+        time_averaging = '30m'
+    )
+
+    # vector mean across samples, so directions don't wrap incorrectly through north
+    if len(_u.shape) > 2:
+        _u = np.nanmean(_u, axis = 1)
+    if len(_v.shape) > 2:
+        _v = np.nanmean(_v, axis = 1)
+
+    _wd_all, _ws_all = wind_direction(_u, _v, return_speed = True)
+    _wd_all = np.degrees(_wd_all) % 360
+
+    _n_sectors = 36
+    _sector_width = 360 / _n_sectors
+    _dir_edges = np.linspace(-_sector_width / 2, 360 - _sector_width / 2, _n_sectors + 1)
+    _dir_centres = np.radians(_dir_edges[:-1] + _sector_width / 2)
+
+    _mcolors = plt.matplotlib.colors
+
+    _speed_edges = np.arange(0, 20, 2)  # 2 m/s bins from 0 to 18
+    _speed_labels = [f'{_lo}-{_lo + 2}' for _lo in _speed_edges[:-1]]
+
+    _speed_cmap = _mcolors.ListedColormap(
+        plt.cm.turbo(np.linspace(0, 1, len(_speed_labels)))
+    )
+    _speed_norm = _mcolors.BoundaryNorm(_speed_edges, _speed_cmap.N)
+    _speed_colours = _speed_cmap.colors
+
+    _fig, _axs = plt.subplots(
+        4,1 , figsize = (10, 20),
+        subplot_kw = {'projection': 'polar'}
+    )
+
+    for _i, _ax in enumerate(_axs.flatten()):
+        if not isinstance(_ax, plt.Axes):
+            continue
+        _station = 4 - _i  # NCAR1 is southernmost, so plot it at the bottom
+        _wd = _wd_all[:, _station - 1]
+        _ws = _ws_all[:, _station - 1]
+
+        _valid = np.isfinite(_wd) & np.isfinite(_ws)
+        _wd, _ws = _wd[_valid], _ws[_valid]
+
+        _ax.set_theta_zero_location('N')
+        _ax.set_theta_direction(-1)  # clockwise - meteorological convention
+
+        if _wd.size == 0:
+            _ax.set_title(f'NCAR{_station} — no data')
+            continue
+
+        _wd = np.where(_wd >= 360 - _sector_width / 2, _wd - 360, _wd)
+
+        _counts, _, _ = np.histogram2d(_wd, _ws, bins = [_dir_edges, _speed_edges])
+        _freq = 100 * _counts / _wd.size  # % of valid records
+
+        _bottom = np.zeros(_n_sectors) + 0.25
+        for _j, (_label, _colour) in enumerate(zip(_speed_labels, _speed_colours)):
+            _ax.bar(
+                _dir_centres, _freq[:, _j],
+                width = np.radians(_sector_width) * 0.9,
+                bottom = _bottom,
+                color = _colour,
+                #edgecolor = 'white', linewidth = 0.5,
+                label = _label if _station == 1 else None
+            )
+            _bottom += _freq[:, _j]
+
+        _ax.set_xticks(np.radians(np.arange(0, 360, 45)))
+        _ax.set_xticklabels(['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'])
+        _ax.set_rlabel_position(280)
+        #_ax.tick_params(axis = 'y', labelsize = 8, colors = 'grey')
+        _ax.set_title(f'NCAR{_station}', pad = 15)
+        _ax.set_ylim(0, 8)
+        _ax.set_yticks([0, 2, 4, 6, 8])
+        _ax.set_yticklabels(['', '2%', '4%', '6%', '8%'], verticalalignment = 'bottom', horizontalalignment = 'right')
+        _ax.grid(color = 'black', linewidth = 0.5, axis = 'y')
+        _ax.xaxis.grid(False)
+
+    _cbar = _fig.colorbar(
+        plt.cm.ScalarMappable(cmap = _speed_cmap, norm = _speed_norm),
+        ax = _axs.tolist(), orientation = 'horizontal',
+        pad = 0.04, fraction = 0.02, shrink = 0.5, aspect = 40,
+        ticks = _speed_edges, spacing = 'proportional',
+        label = 'Wind speed (m/s)'
+    )
+
+    _fig
     return
 
 
