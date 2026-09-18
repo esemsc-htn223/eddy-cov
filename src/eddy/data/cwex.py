@@ -7,9 +7,11 @@ import geopandas as gpd
 from netCDF4 import Dataset
 from matplotlib import pyplot as plt
 from matplotlib import colors as mcolors
+from matplotlib_scalebar.scalebar import ScaleBar
 
 import os
 import pathlib
+import warnings
 from typing import Literal, Iterator
 
 from eddy.util import DATA_DIR
@@ -61,6 +63,8 @@ class CWEX:
         The wind turbine locations.
     locations : gpd.GeoDataFrame
         Towers and turbines together, with a `type` column distinguishing them.
+    plotting_crs : pyproj.CRS
+        The CRS used for site maps - the site's UTM zone, so distances are true metres.
 
     Methods
     -------
@@ -76,6 +80,10 @@ class CWEX:
         Plot a windrose for a given station.
     plot_tke(station, ...)
         Plot the turbulent kinetic energy for a given station.
+    plot_site(time, ...)
+        Map the towers and turbines, with a downwind arrow from each tower.
+    downwind_components(direction, ...)
+        Convert a meteorological wind direction into downwind map components.
     speed_colourmap(...)
         The discrete colourmap used for the wind roses.
     '''
@@ -129,6 +137,7 @@ class CWEX:
             self._var_dims = {v: ds.variables[v].dimensions for v in ds.variables}
 
         self._time = None  # will store cached time values
+        self._plotting_crs = None  # will store the cached site CRS
 
     @classmethod
     def from_dir(cls, dir_path: str|pathlib.Path) -> 'CWEX':
@@ -185,6 +194,26 @@ class CWEX:
         if self._time is None:
             self._time = self.time_axis()
         return self._time
+
+    @property
+    def plotting_crs(self):
+        '''
+        The CRS used for site maps - the local UTM zone, so that distances, arrow lengths and the
+        scale bar are all in true metres.
+
+        Neither of the package-wide CRSs is suitable here. `BASE_CRS` (Web Mercator), which every
+        `@standardise_df` loader reprojects to, overstates distance by a factor of 1.34 at this
+        site's latitude. `PLOTTING_CRS` is geographic, in degrees, and exists for folium.
+
+        Cached after the first call, and cleared by `refresh()`.
+        '''
+        if self._plotting_crs is None:
+            self._plotting_crs = self.locations.estimate_utm_crs()
+        return self._plotting_crs
+
+    @plotting_crs.setter
+    def plotting_crs(self, crs):
+        self._plotting_crs = crs
 
     # --- station handling -------------------------------------------------------------------
 
@@ -670,10 +699,185 @@ class CWEX:
             return time, direction, speed
         return direction, speed
 
+    @staticmethod
+    def downwind_components(
+            direction: np.ndarray, speed: np.ndarray|None = None, *,
+            units: Literal['deg', 'rad'] = 'deg'
+    ) -> tuple[np.ndarray, np.ndarray]:
+        '''
+        Convert a meteorological wind direction into map components pointing downwind.
+
+        `wind()` reports the direction the wind blows *from*, so the downwind vector is the
+        negated pair - which recovers the sign of the original u and v components.
+
+        Parameters
+        ----------
+        direction : np.ndarray
+            Wind direction, as returned by `wind()`.
+        speed : np.ndarray or None, optional
+            If given, the components are scaled by the speed rather than left as unit vectors.
+        units : {'deg', 'rad'}, optional
+            The units of `direction`. Defaults to degrees.
+
+        Returns
+        -------
+        np.ndarray, np.ndarray
+            The eastward and northward components of the downwind direction.
+        '''
+        units = units.lower()
+        if units not in ['deg', 'rad']:
+            raise ValueError(f"Invalid units '{units}'. Must be one of 'deg' or 'rad'.")
+
+        theta = np.radians(direction) if units == 'deg' else direction
+        east, north = -np.sin(theta), -np.cos(theta)
+
+        if speed is not None:
+            east, north = east * speed, north * speed
+        return east, north
+
+    @staticmethod
+    def _vector_mean(
+            direction: np.ndarray, speed: np.ndarray, *, axis: int = 0
+    ) -> tuple[np.ndarray, np.ndarray]:
+        '''
+        Reduce direction and speed along an axis, averaging the wind as a vector.
+
+        Directions are averaged through their components, never as bearings, which would wrap
+        incorrectly through north. The speed is a scalar mean - the conventional mean wind speed.
+
+        Parameters
+        ----------
+        direction : np.ndarray
+            Wind direction in degrees.
+        speed : np.ndarray
+            Wind speed.
+        axis : int, optional
+            The axis to reduce. Defaults to 0, the time axis.
+
+        Returns
+        -------
+        np.ndarray, np.ndarray
+            The mean direction in degrees, and the mean speed.
+        '''
+        east, north = CWEX.downwind_components(direction, speed)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)  # all-NaN slices are expected
+            east, north = np.nanmean(east, axis=axis), np.nanmean(north, axis=axis)
+            speed = np.nanmean(speed, axis=axis)
+
+        return np.degrees(np.arctan2(-east, -north)) % 360, speed
+
+    def _resolve_window(
+            self,
+            time: np.datetime64|str|None = None, *,
+            t_min: np.datetime64|None = None,
+            t_max: np.datetime64|None = None,
+            time_averaging: str|np.timedelta64|None = '30m'
+    ) -> tuple[np.datetime64, np.datetime64, str]:
+        '''
+        Work out which time window to read, from either a timestamp or an explicit window.
+
+        Parameters
+        ----------
+        time : np.datetime64 or str or None, optional
+            A timestamp. The window becomes the averaging bin containing it, or the record
+            nearest it when `time_averaging` is None.
+        t_min, t_max : np.datetime64 or None, optional
+            An explicit window. Cannot be combined with `time`; a missing bound falls back to the
+            start or end of the campaign.
+        time_averaging : str or np.timedelta64 or None, optional
+            The averaging period, used to size the bin around `time`.
+
+        Returns
+        -------
+        np.datetime64, np.datetime64, str
+            The window bounds, and a label describing it for a plot title.
+        '''
+        has_window = t_min is not None or t_max is not None
+
+        if time is not None and has_window:
+            raise ValueError("Give either `time` or `t_min`/`t_max`, not both.")
+        if time is None and not has_window:
+            raise ValueError("Give either `time`, for a single averaging bin, or `t_min`/`t_max`, for a window.")
+
+        if has_window:
+            t_min = self.start_time if t_min is None else np.datetime64(t_min)
+            t_max = self.end_time if t_max is None else np.datetime64(t_max)
+            return t_min, t_max, f'{str(t_min)[:16]} to {str(t_max)[:16]}'
+
+        time = np.datetime64(time, 'ns')
+        if time_averaging is None:
+            # records sit on half-second offsets, so an exact timestamp matches nothing - widen
+            # to the records either side of the instant asked for
+            margin = np.timedelta64(1, 's')
+            return time - margin, time + margin, str(time)[:19]
+
+        period = np.timedelta64(pd.Timedelta(time_averaging)).astype('timedelta64[ns]')
+        period_ns = period.astype('int64')
+        start = ((time.astype('int64') // period_ns) * period_ns).astype('datetime64[ns]')
+        # one ns short of the next bin, as the window mask includes t_max
+        return start, start + period - np.timedelta64(1, 'ns'), f'{str(start)[:16]} + {time_averaging}'
+
+    def _station_snapshot(
+            self, var_name: str, *,
+            t_min: np.datetime64, t_max: np.datetime64,
+            time_averaging: str|np.timedelta64|None = '30m'
+    ) -> np.ndarray:
+        '''
+        Reduce a variable to a single value per station over a time window.
+
+        Parameters
+        ----------
+        var_name : str
+            The variable to read.
+        t_min, t_max : np.datetime64
+            The window to average over.
+        time_averaging : str or np.timedelta64 or None, optional
+            Passed through to `timeseries`.
+
+        Returns
+        -------
+        np.ndarray
+            One value per station, in `self.stations` order. Stations with no valid data are NaN.
+        '''
+        values = self.timeseries(
+            var_name, sample='all', station='all', return_type='data_with_nan',
+            t_min=t_min, t_max=t_max, time_averaging=time_averaging
+        )
+
+        sample_axis = self._sample_axis(var_name, sample='all', station='all')
+
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)  # all-NaN slices are expected
+            if sample_axis is not None:
+                values = np.nanmean(values, axis=sample_axis)
+            values = np.nanmean(values, axis=0)  # collapse the time axis
+
+        return np.atleast_1d(values)
+
+    def _variable_label(self, var_name: str) -> str:
+        '''
+        A display label for a variable, as `long_name / units` where those attributes exist.
+
+        Parameters
+        ----------
+        var_name : str
+            The variable to label.
+
+        Returns
+        -------
+        str
+        '''
+        attributes = self.metadata.get(var_name, {}).get('attributes', {})
+        label = attributes.get('long_name', var_name)
+        units = attributes.get('units')
+        return f'{label} / {units}' if units else label
+
     # --- locations --------------------------------------------------------------------------
 
-    @standardise_df
     @property
+    @standardise_df
     def towers(self) -> gpd.GeoDataFrame:
         '''
         The tower locations, from latitude/longitude/altitude variables stored in the smallest file.
@@ -693,10 +897,11 @@ class CWEX:
             geometry=gpd.points_from_xy(lon, lat, crs='EPSG:4326')
         ).set_index('id')
         gdf['type'] = 'eddy tower'
+        gdf.index = gdf.index.str.upper()
         return gdf
 
-    @standardise_df
     @property
+    @standardise_df
     def turbines(self) -> gpd.GeoDataFrame:
         '''
         The wind turbine locations, from `cwex_turbines.kml`.
@@ -711,13 +916,14 @@ class CWEX:
             raise FileNotFoundError(f"No turbine locations found at {kml_path}.")
 
         gdf = gpd.read_file(kml_path)[['Name', 'geometry']].rename(columns={'Name': 'id'})
-        gdf['id'] = gdf['id'].str.lower()
+        gdf['id'] = gdf['id'].str.upper()
         gdf = gdf.set_index('id').sort_index()
         gdf['type'] = 'wind turbine'
         return gdf
 
-    @standardise_df
+
     @property
+    @standardise_df
     def locations(self) -> gpd.GeoDataFrame:
         '''
         The towers and turbines together.
@@ -889,7 +1095,7 @@ class CWEX:
         ax.grid(color='black', linewidth=0.5, axis='y')
         ax.xaxis.grid(False)
 
-        return ax.figure, ax if return_fig else ax
+        return (ax.figure, ax) if return_fig else ax
 
     def plot_tke(
             self,
@@ -953,7 +1159,229 @@ class CWEX:
         if time.size:
             ax.set_xlim(time[0], time[-1])
 
-        return ax.figure, ax if return_fig else ax
+        return (ax.figure, ax) if return_fig else ax
+
+    def plot_site(
+            self,
+            time: np.datetime64|str|None = None,
+            *,
+            t_min: np.datetime64|None = None,
+            t_max: np.datetime64|None = None,
+            time_averaging: str|np.timedelta64|None = '30m',
+            instrument: Literal['sonic-anemometer', 'weather-vane'] = 'weather-vane',
+            colour_by: str|None = None,
+            cmap: str = 'viridis',
+            colour_limits: tuple[float, float]|None = None,
+            colour_towers: str = 'tab:green',
+            colour_missing: str = 'lightgrey',
+            colour_turbines: str = 'tab:blue',
+            speed_colours: bool = True,
+            speed_bins: np.ndarray|None = None,
+            speed_cmap: str = 'turbo',
+            colour_arrows: str = 'black',
+            arrow_length: float = 150,
+            length_by_speed: bool = False,
+            reference_speed: float = 8,
+            annotate: bool = False,
+            scale_bar: bool = True,
+            colourbar: bool = True,
+            legend: bool = True,
+            crs: str|None = None,
+            pad: float = 300,
+            figsize: tuple[float, float] = (7, 8),
+            title: str|None = None,
+            ax: plt.Axes|None = None,
+            return_fig: bool = False
+    ) -> plt.Axes|tuple[plt.Figure, plt.Axes]:
+        '''
+        Map the towers and turbines, with an arrow from each tower showing the wind at a moment.
+        Arrows point the direction the air is travelling.
+
+        Parameters
+        ----------
+        time : np.datetime64 or str or None, optional
+            The time at which to plot wind direction. The averaging bin containing it is used, or the records either
+            side of it when `time_averaging` is None. Cannot be combined with `t_min`/`t_max`.
+        t_min, t_max : np.datetime64 or None, optional
+            An explicit window over which to average the wind data. Cannot be combined with `time`.
+        time_averaging : str or np.timedelta64 or None, optional
+            The averaging period, e.g. '30m' (the default).
+        instrument : {'sonic-anemometer', 'weather-vane'}, optional
+            Which instrument the wind comes from. Defaults to the 10 m weather vane.
+        colour_by : str or None, optional
+            A variable to colour the tower markers by, e.g. 'co2_4_5m'. If None (default), the
+            markers are a uniform `colour_towers`.
+        cmap : str, optional
+            The colourmap for `colour_by`. Defaults to 'viridis'.
+        colour_limits : tuple of float or None, optional
+            (vmin, vmax) for `colour_by`. If None (default), the values' own range is used.
+        colour_towers : str, optional
+            The tower marker colour when `colour_by` is None.
+        colour_missing : str, optional
+            The marker colour for towers whose `colour_by` value is missing.
+        colour_turbines : str, optional
+            The turbine marker colour.
+        speed_colours : bool, optional
+            If True (default), colour the arrows by wind speed, sharing the wind roses' discrete speed
+            scale. If False, the arrows are a uniform `colour_arrows`.
+        speed_bins : np.ndarray or None, optional
+            Speed bin edges for `speed_colours`. Defaults to 2 m/s bins from 0 to 18.
+        speed_cmap : str, optional
+            The colourmap sampled for the speed bins. Defaults to 'turbo'.
+        colour_arrows : str, optional
+            The arrow colour when `speed_colours` is False.
+        arrow_length : float, optional
+            Arrow length in metres - fixed, or the length drawn at `reference_speed` when
+            `length_by_speed` is True. Defaults to 150m.
+        length_by_speed : bool, optional
+            If True, scale the arrow length with wind speed. Defaults to False.
+        reference_speed : float, optional
+            The speed drawn at `arrow_length` when `length_by_speed` is True, in m/s.
+        annotate : bool, optional
+            If True, label each tower with its station name. Defaults to False.
+        scale_bar : bool, optional
+            If True (default), add a scale bar.
+        colourbar : bool, optional
+            If True (default), add a colourbar for whichever colour mappings are in use.
+        legend : bool, optional
+            If True (default), label the tower and turbine markers.
+        crs : str or None, optional
+            The CRS to draw in. Must be projected in metres, as the arrows and `pad` are metre
+            quantities. Defaults to `self.plotting_crs`, the site's UTM zone.
+        pad : float, optional
+            Metres of margin around the locations. Defaults to 300.
+        figsize : tuple of float, optional
+            Figure size, used only when `ax` is None.
+        title : str or None, optional
+            The axes title. Defaults to the instrument and the time window.
+        ax : matplotlib.axes.Axes or None, optional
+            The axes to draw into. If None, one is created.
+        return_fig : bool, optional
+            If True, return the Figure and Axes. Defaults to False.
+
+        Returns
+        -------
+        matplotlib.axes.Axes or tuple of (matplotlib.figure.Figure, matplotlib.axes.Axes)
+        '''
+        t_min, t_max, window_label = self._resolve_window(
+            time, t_min=t_min, t_max=t_max, time_averaging=time_averaging
+        )
+
+        crs = self.plotting_crs if crs is None else crs
+        crs_info = gpd.GeoSeries([], crs=crs).crs
+        if not crs_info.is_projected:
+            raise ValueError(f"plot_site needs a projected CRS in metres, but got '{crs}', which is geographic.")
+
+        towers = self.towers.reindex(list(self.stations)).to_crs(crs)
+        turbines = self.turbines.to_crs(crs)
+
+        if ax is None:
+            _, ax = plt.subplots(figsize=figsize)
+
+        turbines.plot(ax=ax, color=colour_turbines, marker='1', markersize=100, linewidth=0.75, zorder=2)
+
+        x, y = towers.geometry.x.to_numpy(), towers.geometry.y.to_numpy()
+
+        direction, speed = self.wind(
+            station='all', instrument=instrument, samples='mean',
+            t_min=t_min, t_max=t_max, time_averaging=time_averaging, units='deg'
+        )
+        direction = np.atleast_2d(direction)
+        speed = np.atleast_2d(speed)
+
+        if direction.size:
+            direction, speed = self._vector_mean(direction, speed, axis=0)
+        else:  # the window falls outside the campaign's coverage
+            direction = speed = np.full(self.n_stations, np.nan)
+
+        has_wind = np.isfinite(direction) & np.isfinite(speed)
+
+        # tower markers, optionally carrying a variable
+        values = self._station_snapshot(
+            colour_by, t_min=t_min, t_max=t_max, time_averaging=time_averaging
+        ) if colour_by is not None else None
+
+        marker_mappable = None
+        if values is None:
+            ax.scatter(x, y, color=colour_towers, marker='^', s=60,
+                       edgecolor='black', linewidth=0.5, zorder=4)
+        else:
+            known = np.isfinite(values)
+            limits = colour_limits if colour_limits is not None else (
+                (np.nanmin(values), np.nanmax(values)) if known.any() else (0, 1)
+            )
+            marker_mappable = ax.scatter(
+                x[known], y[known], c=values[known], cmap=cmap,
+                norm=mcolors.Normalize(*limits), marker='^', s=60,
+                edgecolor='black', linewidth=0.5, zorder=4
+            )
+            if (~known).any():
+                ax.scatter(x[~known], y[~known], color=colour_missing, marker='^', s=60,
+                           edgecolor='black', linewidth=0.5, zorder=4)
+
+        # downwind arrows, one per tower with valid wind
+        arrows = None
+        if has_wind.any():
+            east, north = self.downwind_components(direction[has_wind])
+            lengths = (arrow_length * speed[has_wind] / reference_speed) if length_by_speed else arrow_length
+            quiver_kwargs = dict(
+                angles='xy', scale_units='xy', scale=1, pivot='tail',
+                width=0.004, headwidth=4, headlength=5, headaxislength=4.5, zorder=3
+            )
+            if speed_colours:
+                speed_map, speed_norm = self.speed_colourmap(speed_bins, speed_cmap)
+                arrows = ax.quiver(x[has_wind], y[has_wind], east * lengths, north * lengths,
+                                   speed[has_wind], cmap=speed_map, norm=speed_norm, **quiver_kwargs)
+            else:
+                arrows = ax.quiver(x[has_wind], y[has_wind], east * lengths, north * lengths,
+                                   color=colour_arrows, **quiver_kwargs)
+
+            if length_by_speed:
+                ax.quiverkey(arrows, 0.88, 0.04, arrow_length, f'{reference_speed:g} m s$^{{-1}}$',
+                             labelpos='W', coordinates='axes')
+
+        if annotate:
+            for station, x_i, y_i in zip(towers.index, x, y):
+                # above the marker, clear of the arrow leaving it
+                ax.annotate(station, (x_i, y_i), textcoords='offset points', xytext=(0, 8),
+                            ha='center', fontsize=8, zorder=5)
+
+        if legend:
+            ax.legend(
+                handles=[
+                    plt.Line2D([], [], linestyle='none', marker='^', markersize=7,
+                               markerfacecolor=colour_towers if values is None else 'none',
+                               markeredgecolor='black', label='Eddy tower'),
+                    plt.Line2D([], [], linestyle='none', marker='1', markersize=10,
+                               color=colour_turbines, label='Wind turbine')
+                ],
+                loc='best', fontsize=9, frameon=True, fancybox=True, framealpha=0.5
+            )
+
+        if colourbar and marker_mappable is not None:
+            ax.figure.colorbar(marker_mappable, ax=ax, location='right', shrink=0.7,
+                               label=self._variable_label(colour_by))
+        if colourbar and arrows is not None and speed_colours:
+            ax.figure.colorbar(arrows, ax=ax, location='bottom', shrink=0.7,
+                               spacing='proportional', label='Wind speed / m s$^{-1}$')
+
+        bounds = pd.concat([towers, turbines]).total_bounds
+        ax.set_xlim(bounds[0] - pad, bounds[2] + pad)
+        ax.set_ylim(bounds[1] - pad, bounds[3] + pad)
+        ax.set_aspect('equal')
+        ax.set_axis_off()
+
+        if scale_bar:
+            # lower right, to stay clear of the legend; valid because the axes are in true metres
+            ax.add_artist(ScaleBar(1, location='lower right'))
+
+        if title is None:
+            title = f'{instrument} — {window_label}'
+            if not has_wind.any():
+                title = f'{title} — no wind data'
+        ax.set_title(title)
+
+        return (ax.figure, ax) if return_fig else ax
 
     def __repr__(self):
         return self.__str__()

@@ -1060,10 +1060,20 @@ def _(cwex, mo, np, plt):
     )
 
     _im = imread(cwex.dir_path / 'cwex_ncar1_windrose.png')
-    _fig, _ax2 = plt.subplots(figsize=(5,5))
+    _fig, _ax2 = plt.subplots(figsize=(7, 7))
     _ax2.imshow(_im)
+    _ax2.set_axis_off()
 
     mo.hstack([_ax1, _ax2], align = 'center', justify = 'space-around')
+    return
+
+
+@app.cell
+def _(cwex, np):
+    cwex.plot_site(
+        t_min = np.datetime64('2011-07-02T00:00:00'),
+        t_max = np.datetime64('2011-08-17T00:00:00')
+    )
     return
 
 
