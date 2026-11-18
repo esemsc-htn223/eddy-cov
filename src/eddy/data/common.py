@@ -54,7 +54,7 @@ def _standardise_df(df: pd.DataFrame) -> pd.DataFrame:
     pd.DataFrame
         A copy of the input DataFrame, with the above standardisations applied.
     '''
-    df = df.copy()
+    df = df.convert_dtypes().copy()
     cols = df.columns
     # account for camelCase
     new_cols = {}
@@ -213,7 +213,7 @@ def average_over_time(
         data are NaN (masked, if `var` is a masked array).
     '''
 
-    period = np.timedelta64(pd.Timedelta(period)).astype('timedelta64[ns]')
+    period = pd.Timedelta(period).to_timedelta64().astype('timedelta64[ns]')
     if period <= np.timedelta64(0, 'ns'):
         raise ValueError(f"period must be a positive duration, got {period}.")
 

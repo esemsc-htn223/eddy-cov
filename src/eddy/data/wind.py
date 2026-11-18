@@ -25,4 +25,6 @@ def load_wind_locations():
     df_wind = pd.read_excel(WIND_DIR / 'Global-Wind-Power-Tracker-February-2026.xlsx', sheet_name = 'Data')
     gdf_wind = gpd.GeoDataFrame(df_wind, geometry=gpd.points_from_xy(df_wind['Longitude'], df_wind['Latitude'], crs='EPSG:4326'))
     gdf_wind['project'] = gdf_wind['Project Name'].astype(str) + ', phase ' + gdf_wind['Phase Name'].astype(str)
+    gdf_wind.rename(columns = {'GEM phase ID': 'gem_phase_id'}, inplace = True)
+    gdf_wind.set_index('gem_phase_id', inplace = True)
     return gdf_wind
