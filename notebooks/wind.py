@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.24.0"
+__generated_with = "0.25.2"
 app = marimo.App()
 
 
@@ -32,6 +32,7 @@ def _():
 
     from shapely.geometry import LineString, MultiPoint, Point, box
     from shapely.ops import nearest_points
+    from sklearn.neighbors import BallTree
 
     import os
 
@@ -52,7 +53,19 @@ def _():
     import xyzservices.providers as xyz
     from dotenv import load_dotenv
     load_dotenv()
-    return LineString, ScaleBar, folium, gpd, mo, nearest_points, np, pd, plt
+    return (
+        BallTree,
+        LineString,
+        Literal,
+        ScaleBar,
+        folium,
+        gpd,
+        mo,
+        nearest_points,
+        np,
+        pd,
+        plt,
+    )
 
 
 @app.cell
@@ -149,10 +162,11 @@ def _(mo):
 
 
 @app.cell
-def _(gpd, np, pd):
+def _(BallTree, gpd, np, pd):
     def wind_ec_matches(
             gdf_wind: gpd.GeoDataFrame, 
             gdf_ec: gpd.GeoDataFrame, 
+            max_match_dist: int = 100_000, 
             *,
             date: pd.Timestamp|None = None,
             min_height: int|None = None, 
@@ -160,11 +174,10 @@ def _(gpd, np, pd):
             crs: str = 'EPSG:3857',
             site_id_col: str = 'site_id', 
             height_col: str = 'height',
-            max_match_dist: int = 100_000, 
-            only_overlap: bool = False
+            overlap: bool|int = True
         ):
         '''
-        Match wind turbine locations to their nearest eddy covariance tower location.
+        Match wind turbine locations to eddy covariance towers within a specified distance.
 
         Parameters
         ----------
@@ -172,6 +185,8 @@ def _(gpd, np, pd):
             GeoDataFrame containing wind turbine locations and attributes.
         gdf_ec : geopandas.GeoDataFrame
             GeoDataFrame containing eddy covariance tower locations and attributes.
+        max_match_dist : int
+            Maximum distance (in meters) to consider a wind turbine as a match for an eddy covariance tower. Defaults to 100,000 m. If None, all turbines are considered regardless of distance.
         date : pd.Timestamp, optional
             Date to filter wind turbines and eddy covariance towers by their operational status.
             If None, all turbines are included.
@@ -188,8 +203,8 @@ def _(gpd, np, pd):
         height_col : str, optional
             Column name in `gdf_ec` that contains the measurement heights of the eddy covariance towers. Defaults to 'height'. 
             This column is required if `min_height` is specified.
-        max_match_dist : int, optional
-            Maximum distance (in meters) to consider a wind turbine as a match for an eddy covariance tower. Defaults to 100,000 m.
+        overlap : bool, optional
+            If True, only return matches where the wind turbine and eddy covariance tower have overlapping operational periods. Defaults to True.
 
 
         Returns
@@ -203,13 +218,15 @@ def _(gpd, np, pd):
             raise ValueError(f"gdf_ec must contain a '{site_id_col}' column with the tower site IDs.")
         if min_height is not None and height_col not in gdf_ec.columns:
             raise ValueError(f"gdf_ec must contain a '{height_col}' column with the tower heights.")
+        if not isinstance(overlap, (int, bool)):
+            raise ValueError('overlap must be either a boolean for any overlap (True) or ignore overlap (False), or a number of years at a minimum the towers and wind')
 
         gdf_wind = gdf_wind.to_crs(crs).copy()
         gdf_ec = gdf_ec.to_crs(crs).copy()
 
         # slice by time and space
         if date is not None:
-            gdf_wind = gdf_wind.loc[(gdf_wind['start_year'] <= date.year) & (gdf_wind['retired_year'] >= date.year)]
+            gdf_wind = gdf_wind.loc[(gdf_wind['start_year'] <= date.year) & (gdf_wind['retired_year'].fillna(9999) >= date.year)]  # retired_year = na when it has never retired - so treat this as the far future
             gdf_ec = gdf_ec.loc[(gdf_ec['first_year'] <= date.year) & (gdf_ec['last_year'] >= date.year)]
 
         if bounds:
@@ -241,29 +258,62 @@ def _(gpd, np, pd):
 
         gdf_ec_grouped['eddy_geometry'] = gdf_ec_grouped['geometry']
         wind_cols = ['project', 'capacity_mw', 'start_year', 'retired_year', 'project_name', 'phase_name', 'installation_type', 'status', 'location_accuracy', 'geometry']
-        gdf_nbrs = gdf_wind[
-            wind_cols
-        ].rename(columns={col: f'wind_{col}' for col in wind_cols if col != 'geometry'}).sjoin_nearest(
-            gdf_ec_grouped,
-            how = 'inner', distance_col = 'dist_m',
-            max_distance = max_match_dist
+
+        RADIANS_TO_METERS = 6.371e6  # approximate mean radius of the Earth in meters
+
+        ball_tree = BallTree(
+            np.deg2rad(
+                np.reshape(gdf_wind.to_crs('EPSG:4326').geometry.apply(lambda geom: (geom.y, geom.x)).to_list(), (-1, 2))
+            ), 
+            metric='haversine'
         )
-        del gdf_ec_grouped  # free memory
+        wind_matches, distances_rad = ball_tree.query_radius(
+            np.deg2rad(
+                np.reshape(gdf_ec_grouped.to_crs('EPSG:4326').geometry.apply(lambda geom: (geom.y, geom.x)).to_list(), (-1, 2))
+            ), 
+            r=max_match_dist / RADIANS_TO_METERS,  # query must be in radians to match lat/lon units
+            return_distance=True
+        )
+        ec_ind = np.repeat(np.arange(len(distances_rad)), [len(ds) for ds in distances_rad])
+        wind_ind = np.concatenate(wind_matches) if len(wind_matches) > 0 else np.empty(0, dtype = int)  # w ind
+        distances_rad = np.concatenate(distances_rad) if len(distances_rad) > 0 else np.empty(0, dtype=float)
 
-        gdf_nbrs['wind_ec_overlap'] = gdf_nbrs.apply(
-            lambda row: max(0, min(row['wind_retired_year'], row['eddy_last_year']) - max(row['wind_start_year'], row['eddy_first_year'])),
+        # collect results into a gdf
+        gdf_nbrs = gdf_wind.iloc[wind_ind][wind_cols].rename(columns={col: f'wind_{col}' for col in wind_cols}).reset_index()
+        wind_id_col = gdf_nbrs.columns[0]
+
+        gdf_nbrs['dist_m'] = distances_rad * RADIANS_TO_METERS
+        gdf_nbrs[site_id_col] = gdf_ec_grouped.iloc[ec_ind].index.to_numpy()
+        gdf_nbrs.index = gdf_nbrs[wind_id_col].astype(str) + '_' + gdf_nbrs[site_id_col].astype(str)
+        gdf_nbrs = gdf_nbrs.join(gdf_ec_grouped, on = site_id_col, how = 'left')
+        gdf_nbrs.set_geometry('wind_geometry', inplace = True)
+
+        del gdf_ec_grouped, ball_tree  # free memory
+
+
+        # Calculate temporal overlaps -- TODO: include EC tower measurement periods: for ameriflux, this is in the BADM: gdf_nbrs = gdf_nbrs.join(gdf_ameriflux_badm[['FLUX_MEASUREMENTS_DATE_START', 'FLUX_MEASUREMENTS_DATE_END']], on = site_id_col)
+        fill_na_far_future = lambda x: 9999 if pd.isna(x) else x
+
+        gdf_nbrs['n_overlap_yrs'] = gdf_nbrs.apply(
+            lambda row: max(0, min(fill_na_far_future(row['wind_retired_year']), row['eddy_last_year']) - max(fill_na_far_future(row['wind_start_year']), row['eddy_first_year'])),
             axis = 1
-        ).astype(bool)
+        ).astype(int)
 
-        if only_overlap:
-            gdf_nbrs = gdf_nbrs.loc[gdf_nbrs['wind_ec_overlap']]
+        gdf_nbrs['overlap'] = gdf_nbrs['n_overlap_yrs'] > 0
+        gdf_nbrs['overlap_yrs'] = gdf_nbrs.apply(
+            lambda row: list(range(max(fill_na_far_future(row['wind_start_year']), row['eddy_first_year']), min(fill_na_far_future(row['wind_retired_year']), row['eddy_last_year']))),
+            axis = 1
+        )
 
-        first_cols = ['wind_project', site_id_col, 'dist_m', 'wind_capacity_mw', 'wind_start_year', 'wind_retired_year', 'eddy_first_year', 'eddy_last_year', 'wind_ec_overlap']
+        if overlap == True:
+            gdf_nbrs = gdf_nbrs.loc[gdf_nbrs['overlap']]
+        elif isinstance(overlap, int):
+            gdf_nbrs = gdf_nbrs.loc[gdf_nbrs['n_overlap_yrs'] >= overlap]
+
+        first_cols = [wind_id_col, 'wind_project', site_id_col, 'dist_m', 'n_overlap_yrs', 'wind_capacity_mw', 'wind_start_year', 'wind_retired_year', 'eddy_first_year', 'eddy_last_year', 'overlap', 'overlap_yrs']
         other_cols = [col for col in gdf_nbrs.columns if col not in first_cols]
         gdf_nbrs = gdf_nbrs[first_cols + other_cols]
-
-        # TODO: time alignment of wind turbine operation and EC tower measurement periods
-        #gdf_nbrs = gdf_nbrs.join(gdf_ameriflux_badm[['FLUX_MEASUREMENTS_DATE_START', 'FLUX_MEASUREMENTS_DATE_END']], on = site_id_col)
+        gdf_nbrs.index.name = 'match_id'
 
         return gdf_nbrs.sort_values(by = 'dist_m')
 
@@ -522,6 +572,14 @@ def _(GDF_STATES, LineString, ScaleBar, folium, gpd, np, pd, plt):
     return (plot_wind_ec_matches,)
 
 
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    #### 1.1 Global ballpark - GEM wind data
+    """)
+    return
+
+
 @app.cell
 def _(
     GDF_COUNTRIES,
@@ -529,30 +587,38 @@ def _(
     gdf_wind,
     mo,
     plot_wind_ec_matches,
+    plt,
     wind_ec_matches,
 ):
-    match_dist = 20_000  # m
-
+    match_dist = 35_000  # m
+    min_years = 2
 
     gdf_matches = wind_ec_matches(
         gdf_wind, gdf_fluxnet, 
         max_match_dist = match_dist,  # m
-        only_overlap = True
+        overlap = min_years  # 2 years minimum 
     )
 
     _ax = plot_wind_ec_matches(
         gdf_matches,
         pad = 500000,
         gdf_borders = GDF_COUNTRIES,
-        scale_bar = False
+        scale_bar = False,
+        figsize = (15, 7)
     )
+
+    _fig, _ax_hist  = plt.subplots(1,1, figsize = (7,5))
+    (gdf_matches['dist_m']/1000).plot.hist(bins = 250, ax = _ax_hist)
 
 
     mo.vstack([
-        mo.md(f'### Wind Turbine to EC Tower Matches (max distance = {match_dist/1000:.0f} km)'),
+        mo.md(f'### Wind Turbine to EC Tower Matches (max dist. = {match_dist/1000:.0f}km, min overlap = {min_years}yrs)'),
         _ax,
-        # gdf_matches,
-        (gdf_matches['dist_m'] / 1000).rename('dist_km').describe().round(1).to_frame().T[['count', 'mean', '50%', 'min', 'max']].convert_dtypes()
+        mo.hstack([
+            _ax_hist,
+            (gdf_matches['dist_m'] / 1000).rename('dist (km)').describe().round(1).to_frame().T[['count', 'mean', '50%', 'min', 'max']].convert_dtypes()
+        ], align = 'center')
+
     ], align = 'center')
     return (gdf_matches,)
 
@@ -564,6 +630,19 @@ def _(gdf_matches):
 
 
 @app.cell
+def _(gdf_matches):
+    gdf_matches.groupby('site_id').agg(
+        n_wind_matches = ('wind_project', 'count'),
+        n_below_5km = ('dist_m', lambda x: (x < 5000).sum()),
+        min_dist_m = ('dist_m', 'min'),
+        max_dist_m = ('dist_m', 'max'),
+        mean_dist_m = ('dist_m', 'mean'),
+        median_dist_m = ('dist_m', 'median'),
+    ).sort_values('min_dist_m')
+    return
+
+
+@app.cell
 def _(gdf_matches, gdf_wind):
     gdf_wind.loc[gdf_wind['project'].isin(gdf_matches['wind_project'])]
     return
@@ -571,7 +650,7 @@ def _(gdf_matches, gdf_wind):
 
 @app.cell
 def _(gdf_matches):
-    gdf_matches.loc[gdf_matches['site_id'].str.startswith('DE-')]['wind_project'].unique().tolist()
+    gdf_matches.loc[gdf_matches['site_id'] == 'DE-RuC']
     return
 
 
@@ -581,18 +660,48 @@ async def _(eddy, gdf_matches):
         gdf_matches['site_id'].unique().tolist(), 
     )
 
-    fs_ruc = site_files['DE-RuC']
-    fs_hai = site_files['DE-Hai']
-    fs_myb = site_files['US-Myb']
-    fs_hdn = site_files['DE-Hdn']
-    fs_wjs = site_files['US-Wjs']
-    fs_rum = site_files['DE-RuM']
-    return (fs_ruc,)
+    fs_de_ruc = site_files['DE-RuC']
+    fs_de_hai = site_files['DE-Hai']
+    fs_de_hdn = site_files['DE-Hdn']
+    fs_de_rum = site_files['DE-RuM']
+
+    fs_us_myb = site_files['US-Myb']
+    fs_us_wjs = site_files['US-Wjs']
+    return
 
 
 @app.cell
-def _(fs_ruc):
-    fs_ruc.fluxmet()
+def _():
+    return
+
+
+@app.cell
+def _():
+    # fs_de_ruc.fluxmet()
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    #### 1.2 Local wind data
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    Sources:
+    - **Germany**: MaStR
+    - **US**: Wind Turbine Database?
+    - **UK**: DUKES?
+    """)
+    return
+
+
+@app.cell
+def _():
     return
 
 
@@ -607,7 +716,10 @@ def _(mo):
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    [Definitions for Woodland Carbon Code RAG ratings](https://www.woodlandcarboncode.org.uk/4-verification#:~:text=units%2E-,Green)
+    - [Definitions for Woodland Carbon Code RAG ratings](https://www.woodlandcarboncode.org.uk/4-verification#:~:text=units%2E-,Green)
+
+    - [Offset Map](https://offsetmap.com/?surface=projects&map=20.13847%2C-64.6875%2C2)
+        - Middleman that charges fees, but states the sources. Useful for determining where to get data on offsets!
     """)
     return
 
@@ -1072,8 +1184,62 @@ def _(cwex, mo, np, plt):
 def _(cwex, np):
     cwex.plot_site(
         t_min = np.datetime64('2011-07-02T00:00:00'),
-        t_max = np.datetime64('2011-08-17T00:00:00')
+        t_max = np.datetime64('2011-08-17T00:00:00'),
+        colour_by = 'co2_4_5m'
     )
+    return
+
+
+@app.cell
+def _(cwex):
+    wd, ws = cwex.wind(station = 1)
+    return wd, ws
+
+
+@app.cell
+def _(np, plt, wd, ws):
+    _fig, _ax = plt.subplots(figsize=(10, 10), subplot_kw={'projection': 'polar'})
+
+    _ax.scatter(
+        np.radians(wd), ws, s = 1, alpha = 0.2
+    )
+    _ax.set_theta_zero_location('N')
+    _ax.set_theta_direction(-1)
+    _ax
+
+
+    _WIDTH = 5  # degrees
+    _ax.axvspan(
+        np.radians(180-_WIDTH/2), np.radians(180+_WIDTH/2), color = 'red', alpha = 0.2
+    )
+
+    _index = (wd >= 180-_WIDTH/2) & (wd <= 180+_WIDTH/2)
+
+    _ax.scatter(
+        np.radians(wd[_index]), ws[_index], s = 2, alpha = 1, color = 'red'
+    )
+    return
+
+
+@app.cell
+def _(cwex):
+    cwex.metadata
+    return
+
+
+@app.cell
+def _(Literal):
+    def candidate_wakes(
+            tower: Literal['NCAR1']
+        ):
+        '''
+        Return times in which it is likely that the given tower is in the wake of a wind turbine.
+        Determined by the wind direction being within a given width of the direction from the turbine to the tower.
+        Wind speed threshold may also be applied.
+
+
+        '''
+
     return
 
 
