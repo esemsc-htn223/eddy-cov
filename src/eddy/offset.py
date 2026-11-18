@@ -11,7 +11,8 @@ from shapely.ops import nearest_points
 from eddy.util import DISTANCE_CRS, PLOTTING_CRS, BASEMAP_DEFAULT
 
 
-def wind_offset_matches(
+
+def wind_farm_offset_neighbours(
         gdf_wind: gpd.GeoDataFrame,
         gdf_offset: gpd.GeoDataFrame,
         *,
@@ -21,7 +22,7 @@ def wind_offset_matches(
         max_match_dist: int = 10_000,
     ) -> gpd.GeoDataFrame:
     '''
-    Match wind turbines to every carbon offset project within a given distance of them.
+    Match wind farms to every carbon offset project within a given distance.
 
     Parameters
     ----------
@@ -135,7 +136,8 @@ def _turbine_icon(colour: str, size: int) -> folium.DivIcon:
     )
 
 
-def plot_wind_offset_folium(
+
+def explore_wind_farm_offset_neighbours(
         gdf_matches: gpd.GeoDataFrame,
         *,
         gdf_base: gpd.GeoDataFrame|None = None,
