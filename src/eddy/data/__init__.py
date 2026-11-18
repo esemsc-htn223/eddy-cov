@@ -1,4 +1,4 @@
-from eddy.data import wind, flux, offset, cwex, reanalysis
+from eddy.data import turbines, flux, offset, cwex, reanalysis
 from eddy.data.cwex import CWEX, CWEX_DIR
 from eddy.data.reanalysis import (
     REANALYSIS_DIR, Coverage, Reanalysis, ERA5, WindToolkit, get_dataset, datasets_for_site
@@ -11,7 +11,7 @@ from eddy.data.common import (
 )
 
 __all__ = [
-    'wind', 'flux', 'offset', 'cwex', 'reanalysis',
+    'turbines', 'flux', 'offset', 'cwex', 'reanalysis',
     'CWEX', 'CWEX_DIR',
     'REANALYSIS_DIR', 'Coverage', 'Reanalysis', 'ERA5', 'WindToolkit',
     'get_dataset', 'datasets_for_site',
