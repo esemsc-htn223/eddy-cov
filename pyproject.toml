@@ -5,6 +5,7 @@ description = "Testing eddy covariance data"
 readme = "README.md"
 requires-python = ">=3.14.6,<3.15"
 authors = [{ name = "esemsc-htn223", email = "htn223@ic.ac.uk" }]
+dependencies = ["h5pyd>=1.0.0,<2", "cdsapi>=0.7.7,<0.8"]
 
 [build-system]
 requires = ["hatchling"]

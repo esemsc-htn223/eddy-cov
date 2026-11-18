@@ -15,7 +15,9 @@ import warnings
 from typing import Literal, Iterator
 
 from eddy.util import DATA_DIR
+from eddy.wind import WindProfile, get_profile, CovarianceAccumulator
 from eddy.data.common import smallest_file, var_metadata, average_over_time, standardise_df
+from eddy.data.reanalysis import get_dataset
 
 FLUX_DIR = DATA_DIR / 'flux'
 NCAR_DIR = FLUX_DIR / 'NCAR'
@@ -65,6 +67,13 @@ class CWEX:
         Towers and turbines together, with a `type` column distinguishing them.
     plotting_crs : pyproj.CRS
         The CRS used for site maps - the site's UTM zone, so distances are true metres.
+    sonic_height_m, vane_height_m : float
+        Measurement heights of the two wind instruments.
+    turbine_hub_height_m, turbine_rotor_diameter_m : float
+        Turbine geometry, so the rotor spans the hub height plus or minus half the diameter.
+    canopy_height_m, displacement_height_m : float
+        Maize canopy height and the zero-plane displacement derived from it, used when
+        extrapolating wind through the surface layer.
 
     Methods
     -------
@@ -76,6 +85,8 @@ class CWEX:
         Estimated turbulent kinetic energy from the sonic anemometer components.
     wind(...)
         Horizontal wind direction and speed for a measurement set.
+    turbine_wind(turbine, ...)
+        Estimated wind direction and speed at a turbine, from the towers or from reanalysis.
     plot_windrose(station, ...)
         Plot a windrose for a given station.
     plot_tke(station, ...)
@@ -92,6 +103,14 @@ class CWEX:
     _FILENAME_TIME_FORMAT = '%Y%m%d%H'
     _TURBINE_KML = 'cwex_turbines.kml'
     _DEFAULT_FILE_DURATION = np.timedelta64(4, 'h')
+
+    turbine_hub_height_m = 80.0 
+    turbine_rotor_diameter_m = 74.0 
+
+    sonic_height_m = 4.5
+    vane_height_m = 10.0
+    canopy_height_m = 2.5  # mature maize; the crop grew from ~1 m in late June to ~2.7 m by August
+    displacement_height_m = 1.7  # 0.67 * canopy height
 
     def __init__(self, dir_path: str|pathlib.Path = CWEX_DIR):
         '''
@@ -699,6 +718,501 @@ class CWEX:
             return time, direction, speed
         return direction, speed
 
+    # --- surface layer ----------------------------------------------------------------------
+
+    def _dense_bins(
+            self, *, t_min: np.datetime64|None, t_max: np.datetime64|None,
+            time_averaging: str|np.timedelta64
+    ) -> tuple[np.ndarray, int, int]:
+        '''
+        The full set of averaging bins between t_min and t_max. Includes bins containing no data.
+
+        Parameters
+        ----------
+        t_min, t_max : np.datetime64 or None
+            The time window. If None, the dataset's start and end times are used.
+        time_averaging : str or np.timedelta64
+            The bin length.
+
+        Returns
+        -------
+        np.ndarray, int, int
+            Bin start times, first bin index, number of bins.
+        '''
+        period_ns = pd.Timedelta(time_averaging).as_unit('ns').value
+        if period_ns <= 0:
+            raise ValueError(f"time_averaging must be a positive duration, got {time_averaging}.")
+
+        start = np.datetime64(self.start_time if t_min is None else t_min, 'ns').astype('int64')
+        end = np.datetime64(self.end_time if t_max is None else t_max, 'ns').astype('int64')
+
+        first_bin = start // period_ns
+        n_bins = int(end // period_ns - first_bin) + 1
+        times = (np.arange(n_bins) + first_bin) * period_ns
+
+        return times.astype('datetime64[ns]'), int(first_bin), n_bins
+
+    def _surface_fluxes(
+            self, *,
+            station: int|str = 'all',
+            t_min: np.datetime64|None = None,
+            t_max: np.datetime64|None = None,
+            time_averaging: str|np.timedelta64 = '30m',
+            return_time: bool = False
+    ) -> dict[str, np.ndarray]|tuple[np.ndarray, dict[str, np.ndarray]]:
+        '''
+        Compute friction velocity, heat flux and Obukhov length per averaging block from the sonic anemometers.
+
+        Parameters
+        ----------
+        station : int or str, optional
+            A station name, a 1-based index, or 'all' (default).
+        t_min, t_max : np.datetime64 or None, optional
+            Bounds on the timestamps to include. If None (default), no bound is applied.
+        time_averaging : str or np.timedelta64, optional
+            The block length. Default is '30m'. Must be greater than the record length 
+            (1s) to allow covariances to be computed.
+        return_time : bool, optional
+            If True, also return the block start times. Defaults to False.
+
+        Returns
+        -------
+        dict of str: np.ndarray, or (np.ndarray, dict)
+            The output of `eddy.wind.CovarianceAccumulator.fluxes`, on the dense bin grid.
+            If `return_time` is True, returns a tuple of (bin start times, fluxes).
+        '''
+        if time_averaging is None:
+            raise ValueError(
+                "time_averaging cannot be None for surface fluxes - covariances need a block of "
+                "samples. Use a period such as '30m'."
+            )
+
+        times, first_bin, n_bins = self._dense_bins(
+            t_min=t_min, t_max=t_max, time_averaging=time_averaging
+        )
+        period_ns = pd.Timedelta(time_averaging).as_unit('ns').value
+
+        keeps_station = isinstance(station, str) and station.lower() == 'all'
+        shape = (n_bins, self.n_stations) if keeps_station else (n_bins,)
+        moments = CovarianceAccumulator(shape)
+
+        read = dict(sample='all', station=station, return_type='data_with_nan')
+        for file_path, file_start, needs_slicing in self._relevant_files(t_min, t_max):
+            with Dataset(file_path) as ds:
+                record_times = self._file_times(ds, file_start)
+                components = [self.file_timeseries(ds, name, **read)
+                              for name in ('u_4_5m', 'v_4_5m', 'w_4_5m', 'tc_4_5m')]
+
+            if needs_slicing:
+                mask = self._window_mask(record_times, t_min, t_max)
+                record_times = record_times[mask]
+                components = [c[mask] for c in components]
+
+            if not record_times.size:
+                continue
+
+            # every sample in a record has the same timestamp
+            bin_index = (record_times.astype('datetime64[ns]').astype('int64') // period_ns) - first_bin
+            bin_index = np.repeat(bin_index[:, None], self.n_samples, axis=1)
+
+            inside = (bin_index >= 0) & (bin_index < n_bins)
+            if not inside.all():
+                bin_index = np.where(inside, bin_index, 0)
+                components = [np.where(inside.reshape(inside.shape + (1,) * (c.ndim - 2)), c, np.nan)
+                              for c in components]
+
+            moments.add(bin_index, *components)
+
+        fluxes = moments.fluxes()
+
+        if return_time:
+            return times, fluxes
+        return fluxes
+
+    def _binned_components(
+            self, u_var: str, v_var: str, *,
+            station: int|str = 'all',
+            t_min: np.datetime64|None = None,
+            t_max: np.datetime64|None = None,
+            time_averaging: str|np.timedelta64 = '30m'
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        '''
+        Mean wind components per averaging bin, on the dense grid from `_dense_bins`.
+
+        Parameters
+        ----------
+        u_var, v_var : str
+            The component variables to read.
+        station : int or str, optional
+            A station name, a 1-based index, or 'all' (default).
+        t_min, t_max : np.datetime64 or None, optional
+            Bounds on the timestamps to include. If None (default), no bound is applied.
+        time_averaging : str or np.timedelta64, optional
+            The bin length. Defaults to '30m'.
+
+        Returns
+        -------
+        np.ndarray, np.ndarray, np.ndarray
+            Bin start times, and the eastward and northward mean components. Empty bins are NaN.
+        '''
+        times, first_bin, n_bins = self._dense_bins(
+            t_min=t_min, t_max=t_max, time_averaging=time_averaging
+        )
+        period_ns = pd.Timedelta(time_averaging).as_unit('ns').value
+
+        keeps_station = isinstance(station, str) and station.lower() == 'all'
+        shape = (n_bins, self.n_stations) if keeps_station else (n_bins,)
+        totals = {name: np.zeros(shape) for name in ('u', 'v', 'n')}
+
+        sample_axis = self._sample_axis(u_var, sample='all', station=station)
+        read = dict(sample='all', station=station, return_type='data_with_nan')
+
+        for file_path, file_start, needs_slicing in self._relevant_files(t_min, t_max):
+            with Dataset(file_path) as ds:
+                record_times = self._file_times(ds, file_start)
+                u = self.file_timeseries(ds, u_var, **read)
+                v = self.file_timeseries(ds, v_var, **read)
+
+            if needs_slicing:
+                mask = self._window_mask(record_times, t_min, t_max)
+                record_times, u, v = record_times[mask], u[mask], v[mask]
+
+            if not record_times.size:
+                continue
+
+            bin_index = (record_times.astype('datetime64[ns]').astype('int64') // period_ns) - first_bin
+            if sample_axis is not None:
+                bin_index = np.repeat(bin_index[:, None], self.n_samples, axis=1)
+
+            inside = (bin_index >= 0) & (bin_index < n_bins)
+            valid = np.isfinite(u) & np.isfinite(v)
+            if not inside.all():
+                bin_index = np.where(inside, bin_index, 0)
+                valid &= inside.reshape(inside.shape + (1,) * (valid.ndim - inside.ndim))
+
+            np.add.at(totals['u'], bin_index, np.where(valid, u, 0.0))
+            np.add.at(totals['v'], bin_index, np.where(valid, v, 0.0))
+            np.add.at(totals['n'], bin_index, valid.astype(np.float64))
+
+        counts = np.where(totals['n'] > 0, totals['n'], np.nan)
+        return times, totals['u'] / counts, totals['v'] / counts
+
+    def _tower_offsets(self, turbine: str) -> tuple[np.ndarray, np.ndarray]:
+        '''
+        The direction and distance from each tower to a turbine in metres.
+
+        Uses `plotting_crs` (the site's UTM zone) rather than `BASE_CRS` to minimise distortion.
+
+        Parameters
+        ----------
+        turbine : str
+            A turbine id from the index of `turbines`.
+
+        Returns
+        -------
+        np.ndarray, np.ndarray
+            Unit vectors from each tower to the turbine with shape (n_stations, 2), and the
+            distances in metres with shape (n_stations,).
+        '''
+        towers = self.towers.to_crs(self.plotting_crs).reindex(list(self.stations))
+        target = self.turbines.to_crs(self.plotting_crs).loc[turbine, 'geometry']
+
+        offsets = np.stack([target.x - towers.geometry.x.to_numpy(),
+                            target.y - towers.geometry.y.to_numpy()], axis=-1)
+        distances = np.hypot(offsets[:, 0], offsets[:, 1])
+
+        return offsets / distances[:, None], distances
+
+    def _tower_weights(
+            self, turbine: str, direction: np.ndarray, *,
+            scheme: Literal['upwind', 'idw', 'nearest', 'mean'] = 'upwind'
+    ) -> tuple[np.ndarray, np.ndarray]:
+        '''
+        How much each tower contributes to the wind estimated at a turbine. Weights towers 
+        by distance and alignment with the wind, allowing only towers upwind of the turbine to be
+        considered in wake calculations.
+
+        Parameters
+        ----------
+        turbine : str
+            A turbine id from the index of `turbines`.
+        direction : np.ndarray
+            Wind direction in degrees at each tower. Must have shape (n_time_steps, n_stations).
+        scheme : {'upwind', 'idw', 'nearest', 'mean'}, optional
+            - **'upwind'**: (default) weights each tower by (1 + alignment) / 2 over its distance, where
+            alignment is the cosine between the tower's downwind direction and the bearing to the
+            turbine. Towers directly upwind have weights of 1.0, crosswind towers have weights of 0.5, 
+            and any directly downwind have weights of 0.0.
+            - **'idw'**: No alingment, only distance weighting.
+            - **'nearest'**: Only considers the closest tower. 
+            - **'mean'**: Weights every tower equally.
+
+        Returns
+        -------
+        np.ndarray, np.ndarray, np.ndarray
+            weights, n_towers, best_alignment
+            - weights: Weights summing to one along the station axis, with the same shape as 
+            `direction` (n_time_steps, n_stations). NaN weights indicate no tower was upwind of the turbine at that time step.
+            - n_towers: The number of contributing towers per time step, with shape (n_time_steps,).
+            - best_alignment: The best alignment achieved at each step. Shape (n_time_steps,).
+        '''
+        scheme = scheme.lower()
+        if scheme not in ('upwind', 'idw', 'nearest', 'mean'):
+            raise ValueError(
+                f"Invalid towers '{scheme}'. Must be one of 'upwind', 'idw', 'nearest' or 'mean'."
+            )
+
+        unit, distances = self._tower_offsets(turbine)
+
+        east, north = self.downwind_components(direction)
+        alignment = east * unit[:, 0] + north * unit[:, 1]
+
+        if scheme == 'mean':
+            weights = np.ones_like(direction)
+        elif scheme == 'nearest':
+            weights = np.zeros_like(direction)
+            weights[:, int(np.argmin(distances))] = 1.0
+        elif scheme == 'idw':
+            weights = np.broadcast_to(1 / distances, direction.shape).copy()
+        else:
+            weights = (1 + alignment) / 2 / distances
+
+        weights = np.where(np.isfinite(direction), weights, 0.0)
+        n_towers = np.sum(weights > 0, axis=1)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)  # all-NaN steps are expected
+            best_alignment = np.nanmax(np.where(weights > 0, alignment, np.nan), axis=1)
+
+        totals = weights.sum(axis=1, keepdims=True)
+        weights = np.where(totals > 0, weights / np.where(totals > 0, totals, 1.0), np.nan)
+
+        return weights, n_towers, best_alignment
+
+    def turbine_wind(
+            self,
+            turbine: Literal['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8'] = 'B2',
+            *,
+            source: Literal['ec-weather-vane', 'ec-sonic-anemometer', 'reanalysis', 'data-assimilation'],
+            t_min: np.datetime64|None = None,
+            t_max: np.datetime64|None = None,
+            time_averaging: str|np.timedelta64|None = '30m',
+            units: Literal['deg', 'rad'] = 'deg',
+            return_time: bool = False,
+            height: float|None = None,
+            profile: str|WindProfile = 'log-law',
+            towers: Literal['upwind', 'idw', 'nearest', 'mean'] = 'upwind',
+            dataset: str = 'wtk',
+            return_quality: bool = False
+    ) -> tuple[np.ndarray, ...]:
+        '''
+        Timeseries of estimates of the wind direction and speed at the given wind turbine.
+        Estimates are made from either EC wind measurements, reanalysis data, or data assimilation
+        of both.
+
+        Wind speed measurements are extrapolated vertically to hub height using `profile`, and horizontally
+        by weighting measurements from the towers according to `towers`. Note that vertical extrapolation
+        can introduce significant uncertainty, especially at night - see `return_quality` for diagnostics
+        and the `WindProfile` documentation for details. 
+
+        Direction is not extrapolated vertically, as the profile is not well-defined. This is another
+        source of uncertainty/error, again especially at night. TODO: direction profiles
+
+        Parameters
+        ----------
+        turbine : {'B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8'}, optional
+            The wind turbine for which to retrieve wind data. Defaults to 'B2'. Note towers
+            'A1' to 'A5', are ~780 m or more from the nearest tower so quality will be poor.
+        source : {'ec-weather-vane', 'ec-sonic-anemometer', 'reanalysis', 'data-assimilation'}
+            The source of the wind speed data. Does not affect sources for EC calculations, which
+            always use the high frequency 'ec-sonic-anemometer'. Defaults to 'reanalysis'.
+            Note 'data-assimilation' is not yet implemented.
+        t_min : np.datetime64 or None, optional
+            The minimum time to consider. Defaults to None.
+        t_max : np.datetime64 or None, optional
+            The maximum time to consider. Defaults to None.
+        time_averaging : str or np.timedelta64 or None, optional
+            The time averaging interval. Defaults to '30m'. Must be provided for the EC sources,
+            which need a block of samples to form a covariance.
+        units : {'deg', 'rad'}, optional
+            The units for the wind direction. Defaults to 'deg'.
+        return_time : bool, optional
+            If True, also return the timestamps. Defaults to False.
+        height : float or None, optional
+            Height above ground in metres. Defaults to `turbine_hub_height_m`.
+        profile : str or WindProfile, optional
+            The vertical extrapolation, to be passed to `eddy.wind.get_profile`. Accepts names and
+            `WindProfile` subclasses/instances. Defaults to 'log-law'.
+        towers : {'upwind', 'idw', 'nearest', 'mean'}, optional
+            How to weight measurements from each tower. Defaults to 'upwind'. See `_tower_weights`.
+        dataset : str, optional
+            Which reanalysis product to use when `source='reanalysis'`. See
+            `eddy.data.reanalysis.get_dataset`. Defaults to 'wtk' (the NREL WIND Toolkit), which
+            covers North America only.
+        return_quality : bool, optional
+            If True, also return a dict of per-period diagnostics. Defaults to False.
+
+        Returns
+        -------
+        tuple of np.ndarray
+            A tuple containing the times (optional), wind directions, and wind speeds.
+        If `return_quality` is True, also returns a dict of per-period diagnostics at the end of the tuple.
+        '''
+        units = units.lower()
+        if units not in ['deg', 'rad']:
+            raise ValueError(f"Invalid units '{units}'. Must be one of 'deg' or 'rad'.")
+
+        if turbine not in self.turbines.index:
+            raise ValueError(
+                f"Invalid turbine '{turbine}'. Must be one of {list(self.turbines.index)}."
+            )
+
+        source = source.lower().replace('_', '-').replace(' ', '-')
+        height = self.turbine_hub_height_m if height is None else float(height)
+
+        if source == 'data-assimilation':
+            raise NotImplementedError(
+                "turbine_wind(source='data-assimilation') is not yet implemented."
+            )
+
+        if source == 'reanalysis':
+            location = self.turbines.to_crs('EPSG:4326').loc[turbine, 'geometry']
+            result = get_dataset(dataset).wind(
+                location.y, location.x, height=height, t_min=t_min, t_max=t_max,
+                time_averaging=time_averaging, units=units, return_time=return_time
+            )
+            if return_quality:
+                quality = {'source': source, 'dataset': dataset, 'height': height}
+                return (*result, quality)
+            return result
+
+        if source == 'ec-sonic-anemometer' or source == 'sonic':
+            reference_height = self.sonic_height_m
+        elif source == 'ec-weather-vane' or source == 'vane':
+            reference_height = self.vane_height_m
+        else:
+            raise ValueError(
+                f"Invalid source '{source}'. Must be one of 'ec-weather-vane', "
+                "'ec-sonic-anemometer', 'reanalysis' or 'data-assimilation'."
+            )
+
+        if time_averaging is None:
+            raise ValueError(
+                "time_averaging cannot be None for an EC source - the stability correction needs "
+                "a block of samples to form a covariance. Use a period such as '30m'."
+            )
+
+        time, fluxes = self._surface_fluxes(
+            station='all', t_min=t_min, t_max=t_max,
+            time_averaging=time_averaging, return_time=True
+        )
+
+        if reference_height == self.sonic_height_m:
+            tower_direction, tower_speed = fluxes['mean_direction'], fluxes['mean_speed']
+        else:
+            _, east, north = self._binned_components(
+                'U_10m', 'V_10m', station='all',
+                t_min=t_min, t_max=t_max, time_averaging=time_averaging
+            )
+            tower_direction = np.degrees(np.arctan2(-east, -north)) % 360
+            tower_speed = np.hypot(east, north)
+
+        extrapolation = get_profile(profile, displacement_height=self.displacement_height_m)
+        tower_speed_at_height = extrapolation.speed_at(
+            height, reference_height=reference_height, reference_speed=tower_speed,
+            u_star=fluxes['u_star'], obukhov_length=fluxes['obukhov_length']
+        )
+        # the profile is monotonic in a physical surface layer - negatives are a failure of the extrapolation, so treat them as missing
+        tower_speed_at_height = np.where(tower_speed_at_height >= 0, tower_speed_at_height, np.nan)
+
+        weights, n_towers, best_alignment = self._tower_weights(turbine, tower_direction, scheme=towers)
+
+        east, north = self.downwind_components(tower_direction, tower_speed_at_height)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)  # all-NaN blocks are expected
+            east = np.nansum(east * weights, axis=1)
+            north = np.nansum(north * weights, axis=1)
+
+        empty = n_towers == 0
+        east, north = np.where(empty, np.nan, east), np.where(empty, np.nan, north)
+
+        direction = np.arctan2(-east, -north)
+        speed = np.hypot(east, north)
+        if units == 'deg':
+            direction = np.degrees(direction) % 360
+
+        result = (time, direction, speed) if return_time else (direction, speed)
+
+        if return_quality:
+            def combine(values):
+                '''Weight a per-tower diagnostic the same way the wind itself was weighted.'''
+                with warnings.catch_warnings():
+                    warnings.simplefilter('ignore', RuntimeWarning)
+                    return np.where(empty, np.nan, np.nansum(values * weights, axis=1))
+
+            quality = {
+                'source': source, 'height': height, 'reference_height': reference_height,
+                'n_towers': n_towers,
+                'alignment': best_alignment,
+                'reference_speed': combine(tower_speed),
+                'u_star': combine(fluxes['u_star']),
+                'obukhov_length': combine(fluxes['obukhov_length']),
+            }
+            # judge stability on the blend that was actually returned, rather than letting a
+            # barely-weighted tower veto the estimate or a well-weighted one carry it alone
+            quality.update({
+                key: combine(values) if values.dtype.kind == 'f' else values
+                for key, values in extrapolation.validity(
+                    height, obukhov_length=fluxes['obukhov_length']
+                ).items() if key != 'most_valid'
+            })
+            if 'zeta' in quality:
+                quality['most_valid'] = np.abs(quality['zeta']) <= getattr(extrapolation, 'zeta_max', np.inf)
+
+            return (*result, quality)
+
+        return result
+
+    def wake_candidates(
+            self, *, 
+            wake_width_deg: float = 5.0,
+            station: int|str = 'all', 
+            t_min: np.datetime64|None = None,
+            t_max: np.datetime64|None = None, 
+            speed_lower_bound: float|None = None,
+            speed_upper_bound: float|None = None,
+            return_type: Literal['indices', 'times'] = 'indices'
+    ) -> np.ndarray:
+        '''
+        Times for which it was likely a wind wake passed over the given tower. 
+        Candidates are determined based on the wind direction (and speed at the tower if requested).
+
+        Parameters
+        ----------
+        wake_width_deg : float, optional
+            The assumed spread of the wake in degrees. Defaults to 5.0 deg, as 
+            per https://journals.ametsoc.org/view/journals/atot/27/8/2010jtecha1398_1.xml.
+        station : int or str, optional
+            The station number or name. Defaults to 'all'.
+        t_min : np.datetime64 or None, optional
+            The minimum time to consider. Defaults to None.
+        t_max : np.datetime64 or None, optional
+            The maximum time to consider. Defaults to None.
+        speed_lower_bound : float or None, optional
+            The lower bound on wind speed. Defaults to None.
+        speed_upper_bound : float or None, optional
+            The upper bound on wind speed. Defaults to None.
+        return_type : {'indices', 'times'}, optional
+            Whether to return the indices of the candidate times as a boolean array (default) 
+            or the timestamps themselves.
+        
+        Returns
+        -------
+        np.ndarray
+            The indices or timestamps for which a wake was likely present.
+        '''
+        raise NotImplementedError("wake_candidates() is not yet implemented.")
+
     @staticmethod
     def downwind_components(
             direction: np.ndarray, speed: np.ndarray|None = None, *,
@@ -813,7 +1327,7 @@ class CWEX:
             margin = np.timedelta64(1, 's')
             return time - margin, time + margin, str(time)[:19]
 
-        period = np.timedelta64(pd.Timedelta(time_averaging)).astype('timedelta64[ns]')
+        period = pd.Timedelta(time_averaging).to_timedelta64().astype('timedelta64[ns]')
         period_ns = period.astype('int64')
         start = ((time.astype('int64') // period_ns) * period_ns).astype('datetime64[ns]')
         # one ns short of the next bin, as the window mask includes t_max
