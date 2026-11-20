@@ -120,8 +120,8 @@ async def get_fluxnet_site_dirs(
     
     Parameters
     ----------
-    sites : list of str
-        A list of site ids to load.
+    sites : list of str or str
+        The site ids to load, or a single site id.
     snapshot_filepath : pathlib.Path or 'latest', optional
         The path to the FLUXNET snapshot file to use for downloading site files.
         If 'latest', the function will use the latest snapshot file on disk (if available). 
@@ -129,14 +129,14 @@ async def get_fluxnet_site_dirs(
     force_download : bool, optional
         If True, forces a download of the specified FLUXNET site files even if they are already present on disk. 
         Default is False.
-    extract_zip : bool, optional
-        If True, extracts the downloaded .zip files. Default is True.
         
     Returns
     -------
     dict of str: pathlib.Path
         A dictionary with site ids as keys and paths to the loaded or downloaded FLUXNET site
     '''
+    if isinstance(sites, str):
+        sites = [sites]
 
     if snapshot_filepath == 'latest':
         snapshot_filepath = latest_fluxnet_snapshot_path()
