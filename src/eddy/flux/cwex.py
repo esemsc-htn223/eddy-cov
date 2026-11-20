@@ -16,8 +16,8 @@ from typing import Literal, Iterator
 
 from eddy.util import smallest_file, var_metadata, average_over_time, standardise_df
 from eddy.wind import WindProfile, get_profile
-from eddy.wind.data import get_dataset
-from eddy.flux._flux import CovarianceAccumulator
+from eddy.wind.data import get_dataset, DATASETS
+from eddy.flux._flux import CovarianceAccumulator, WakeCandidates, in_wake, wake_half_angle
 from eddy.flux.data import FLUX_DIR
 
 NCAR_DIR = FLUX_DIR / 'NCAR'
@@ -87,12 +87,18 @@ class CWEX:
         Horizontal wind direction and speed for a measurement set.
     turbine_wind(turbine, ...)
         Estimated wind direction and speed at a turbine, from the towers or from reanalysis.
+    wake_candidates(turbine, ...)
+        Periods in which towers may lie in a turbine wake, as a `WakeCandidates` mask.
     plot_windrose(station, ...)
         Plot a windrose for a given station.
+    plot_wake_candidates(station, ...)
+        Plot a station's wind as a polar scatter, highlighting the wake candidates and their speeds.
     plot_tke(station, ...)
         Plot the turbulent kinetic energy for a given station.
     plot_site(time, ...)
         Map the towers and turbines, with a downwind arrow from each tower.
+    plot_wake_geometry(direction, ...)
+        Map the wake wedges assumed by `wake_candidates` for a given wind direction.
     downwind_components(direction, ...)
         Convert a meteorological wind direction into downwind map components.
     speed_colourmap(...)
@@ -103,6 +109,13 @@ class CWEX:
     _FILENAME_TIME_FORMAT = '%Y%m%d%H'
     _TURBINE_KML = 'cwex_turbines.kml'
     _DEFAULT_FILE_DURATION = np.timedelta64(4, 'h')
+    _WIND_INSTRUMENTS = ('sonic-anemometer', 'weather-vane')  # not flute
+    _instrument_aliases = {
+        'sonic-anemometer': 'sonic-anemometer',
+        'sonic': 'sonic-anemometer',
+        'weather-vane': 'weather-vane',
+        'vane': 'weather-vane',
+    }
 
     turbine_hub_height_m = 80.0 
     turbine_rotor_diameter_m = 74.0 
@@ -293,16 +306,24 @@ class CWEX:
         -------
         int or None
         '''
+        axes = self._kept_axes(var_name, sample=sample, station=station)
+        return axes.index('sample') if 'sample' in axes else None
+
+    def _kept_axes(
+            self, var_name: str, *,
+            sample: int|Literal['all'] = 'all',
+            station: int|str = 'all'
+    ) -> list[str]:
+        '''The dimension names of the array `timeseries` would return, in order.'''
         keeps_sample = isinstance(sample, str) and sample.lower() == 'all'
         keeps_station = isinstance(station, str) and station.lower() == 'all'
 
-        axes = [
+        return [
             dim for dim in self._var_dims[var_name]
             if dim == 'time'
             or (dim == 'sample' and keeps_sample)
             or (dim == 'station' and keeps_station)
         ]
-        return axes.index('sample') if 'sample' in axes else None
 
     @staticmethod
     def _flatten_samples(values: np.ndarray, sample_axis: int) -> np.ndarray:
@@ -469,6 +490,70 @@ class CWEX:
         concatenate = np.ma.concatenate if return_type == 'masked_array' else np.concatenate
         return concatenate(chunks, axis=0)
 
+    def _resolve_wake(
+            self, wake_candidates: bool|WakeCandidates|None, *,
+            station: int|str,
+            t_min: np.datetime64|None,
+            t_max: np.datetime64|None
+    ) -> WakeCandidates|None:
+        '''
+        Turn a `wake_candidates` argument into a mask: None for False, the default detection over
+        the given station and window for True, or the object itself after checking it covers `station`.
+        '''
+        if wake_candidates is None or wake_candidates is False:
+            return None
+        if wake_candidates is True:
+            return self.wake_candidates(station=station, t_min=t_min, t_max=t_max)
+        if not isinstance(wake_candidates, WakeCandidates):
+            raise TypeError(f"wake_candidates must be a bool or a WakeCandidates object, got {type(wake_candidates)}.")
+
+        index = self._station_index(station)
+        if isinstance(index, slice):
+            if tuple(wake_candidates.stations) != self.stations:
+                raise ValueError(f"station='all' needs wake candidates for every station {self.stations}, but these cover {wake_candidates.stations}.")
+        elif self.stations[index] not in wake_candidates.stations:
+            raise ValueError(f"Station '{self.stations[index]}' is not covered by these wake candidates, which cover {wake_candidates.stations}.")
+        return wake_candidates
+
+    def _apply_wake(
+            self, values: np.ndarray, times: np.ndarray, wake: WakeCandidates, *,
+            axes: list[str],
+            station: int|str
+    ) -> np.ndarray:
+        '''
+        Set values outside the wake candidate periods to NaN (or mask them, for masked arrays).
+
+        Parameters
+        ----------
+        values : np.ndarray
+            Values with a leading time axis matching `times`.
+        times : np.ndarray
+            The timestamp of each row of `values`.
+        wake : WakeCandidates
+            The candidate periods.
+        axes : list of str
+            The dimension names of `values`, e.g. ['time', 'sample', 'station'].
+        station : int or str
+            The station selection `values` was read with.
+
+        Returns
+        -------
+        np.ndarray
+        '''
+        index = self._station_index(station)
+        mask = wake.at(times, station='all' if isinstance(index, slice) else self.stations[index])
+
+        if mask.ndim == 2 and 'station' not in axes:
+            raise ValueError("Wake candidates for several stations cannot be applied to a variable without a station axis.")
+        mask = mask.reshape([
+            len(times) if dim == 'time' else (mask.shape[1] if dim == 'station' and mask.ndim == 2 else 1)
+            for dim in axes
+        ])
+
+        if np.ma.isMaskedArray(values):
+            return np.ma.masked_where(~np.broadcast_to(mask, values.shape), values)
+        return np.where(mask, values, np.nan)
+
     def timeseries(
             self,
             var_name: str,
@@ -479,11 +564,12 @@ class CWEX:
             return_time: bool = False,
             t_min: np.datetime64|None = None,
             t_max: np.datetime64|None = None,
-            time_averaging: str|np.timedelta64|None = None
+            time_averaging: str|np.timedelta64|None = None,
+            wake_candidates: bool|WakeCandidates = False
     ) -> np.ndarray|tuple[np.ndarray, np.ndarray]:
         '''
-        Read one a time series from all relevant files. Can be optionally indexed by sample and station, and sliced to a time window. 
-        Can also average over fixed-length time bins.
+        Read one a time series from all relevant files. Can be optionally indexed by sample and station, and sliced to a time window.
+        Can also average over fixed-length time bins, and be restricted to periods of likely turbine wakes.
 
         Parameters
         ----------
@@ -504,6 +590,11 @@ class CWEX:
             If given, average over fixed-length time bins, e.g. '30m'. Bins are anchored on the
             Unix epoch, so '30m' bins start on the hour and half hour. Only the time axis is
             reduced; sample and station axes are kept. Not supported with return_type='mask'.
+        wake_candidates : bool or WakeCandidates, optional
+            If True, values outside the periods returned by `wake_candidates()` (with its defaults,
+            over the same station and window) become NaN, or masked for return_type='masked_array'.
+            A `WakeCandidates` object applies its own periods instead. Applied before
+            `time_averaging`. Not supported with return_type='mask'. Defaults to False.
 
         Returns
         -------
@@ -518,9 +609,13 @@ class CWEX:
             raise ValueError(f"t_min ({t_min}) must be less than t_max ({t_max}).")
         if time_averaging is not None and return_type.lower() == 'mask':
             raise ValueError("time_averaging is not supported with return_type='mask'.")
+        if wake_candidates is not False and return_type.lower() == 'mask':
+            raise ValueError("wake_candidates is not supported with return_type='mask'.")
 
-        # times are needed to return them, to slice a partial file, or to build averaging bins
-        need_time = return_time or time_averaging is not None
+        wake = self._resolve_wake(wake_candidates, station=station, t_min=t_min, t_max=t_max)
+
+        # times are needed to return them, to slice a partial file, to build averaging bins, or to apply a wake mask
+        need_time = return_time or time_averaging is not None or wake is not None
 
         time_chunks, var_chunks = [], []
         for times, values in self._iter_chunks(
@@ -533,6 +628,12 @@ class CWEX:
 
         out_var = self._concat(var_chunks, return_type.lower())
         out_time = np.ma.getdata(np.concatenate(time_chunks, axis=0)) if need_time and time_chunks else None
+
+        if wake is not None and out_var.size:
+            out_var = self._apply_wake(
+                out_var, out_time, wake,
+                axes=self._kept_axes(var_name, sample=sample, station=station), station=station
+            )
 
         if time_averaging is not None and out_var.size:
             out_time, out_var = average_over_time(out_time, out_var, time_averaging)
@@ -577,7 +678,8 @@ class CWEX:
             station: int|str = 'all',
             t_min: np.datetime64|None = None,
             t_max: np.datetime64|None = None,
-            return_time: bool = False
+            return_time: bool = False,
+            wake_candidates: bool|WakeCandidates = False
     ) -> np.ndarray|tuple[np.ndarray, np.ndarray]:
         '''
         Timeseries of turbulent kinetic energy, 0.5 * (var(u) + var(v) + var(w)).
@@ -591,12 +693,18 @@ class CWEX:
             Bounds on the timestamps to include.
         return_time : bool, optional
             If True, also return the timestamps. Defaults to False.
+        wake_candidates : bool or WakeCandidates, optional
+            Restrict to periods of likely turbine wakes; other times are NaN. See `timeseries`.
+            Defaults to False.
 
         Returns
         -------
         np.ndarray, or (np.ndarray, np.ndarray)
             TKE in m^2 s^-2, preceded by the timestamps if `return_time` is True.
         '''
+        wake = self._resolve_wake(wake_candidates, station=station, t_min=t_min, t_max=t_max)
+        axes = ['time', 'station'] if isinstance(self._station_index(station), slice) else ['time']
+
         time_chunks, tke_chunks = [], []
 
         for file_path, file_start, needs_slicing in self._relevant_files(t_min, t_max):
@@ -613,6 +721,9 @@ class CWEX:
                 if needs_slicing:
                     mask = self._window_mask(times, t_min, t_max)
                     times, total = times[mask], total[mask]
+
+                if wake is not None and times.size:
+                    total = self._apply_wake(total, times, wake, axes=axes, station=station)
 
                 time_chunks.append(times)
                 tke_chunks.append(0.5 * total)
@@ -633,7 +744,8 @@ class CWEX:
             t_max: np.datetime64|None = None,
             time_averaging: str|np.timedelta64|None = '30m',
             units: Literal['deg', 'rad'] = 'deg',
-            return_time: bool = False
+            return_time: bool = False,
+            wake_candidates: bool|WakeCandidates = False
     ) -> tuple[np.ndarray, ...]:
         '''
         Wind direction and speed from a pair of velocity components.
@@ -657,20 +769,22 @@ class CWEX:
         t_min, t_max : np.datetime64 or None, optional
             Bounds on the timestamps to include.
         time_averaging : str or np.timedelta64 or None, optional
-            Averaging bin length, e.g. '30m' (the default). None disables averaging. Applied 
-            before the samples are handled, so with samples='all' the samples that survive are 
-            the per-sample bin means.
+            Averaging bin length, e.g. '30m' (the default). None disables averaging. 
         units : {'deg', 'rad'}, optional
             Units for the returned direction. Defaults to degrees, on 0-360.
         return_time : bool, optional
             If True, also return the timestamps. Defaults to False.
+        wake_candidates : bool or WakeCandidates, optional
+            Restrict to periods of likely turbine wakes; other times are NaN. See `timeseries`.
+            Defaults to False.
 
         Returns
         -------
         tuple of np.ndarray
-            (direction, speed), preceded by the timestamps if `return_time` is True. With 
-            samples='all' the timestamps repeat, as the samples within a record do not carry 
-            individual timestamps.
+            - (direction, speed) if `return_time` is False
+            - (time, direction, speed) if `return_time` is True. 
+            
+            Note With `samples='all'` timestamps will repeat
         '''
         units = units.lower()
         if units not in ['deg', 'rad']:
@@ -690,8 +804,10 @@ class CWEX:
         else:
             raise ValueError(f"Invalid instrument '{instrument}'. Must be one of 'sonic-anemometer', 'weather-vane', 'sonic', or 'vane'.")
 
+        wake = self._resolve_wake(wake_candidates, station=station, t_min=t_min, t_max=t_max)
         read = dict(sample='all', station=station, return_type='data_with_nan',
-                    t_min=t_min, t_max=t_max, time_averaging=time_averaging)
+                    t_min=t_min, t_max=t_max, time_averaging=time_averaging,
+                    wake_candidates=False if wake is None else wake)
         time, u = self.timeseries(u_var, return_time=True, **read)
         v = self.timeseries(v_var, **read)
 
@@ -699,13 +815,13 @@ class CWEX:
             empty = np.array([], dtype=np.float64)
             return (np.array([], dtype='datetime64[ns]'), empty, empty) if return_time else (empty, empty)
 
-        # 4.5 m anemometers have a sample axis, but 10 m vanes do not. Selecting a single station
-        # drops an axis, so find the sample axis by name rather than by counting dimensions.
         sample_axis = self._sample_axis(u_var, sample='all', station=station)
         if sample_axis is not None:
             if samples == 'mean':
-                u = np.nanmean(u, axis=sample_axis)
-                v = np.nanmean(v, axis=sample_axis)
+                with warnings.catch_warnings():
+                    warnings.simplefilter('ignore', RuntimeWarning)  # all-NaN records are expected
+                    u = np.nanmean(u, axis=sample_axis)
+                    v = np.nanmean(v, axis=sample_axis)
             else:
                 # flatten the samples into the time axis, so each is its own observation
                 u = self._flatten_samples(u, sample_axis)
@@ -894,9 +1010,12 @@ class CWEX:
                 bin_index = np.where(inside, bin_index, 0)
                 valid &= inside.reshape(inside.shape + (1,) * (valid.ndim - inside.ndim))
 
-            np.add.at(totals['u'], bin_index, np.where(valid, u, 0.0))
-            np.add.at(totals['v'], bin_index, np.where(valid, v, 0.0))
-            np.add.at(totals['n'], bin_index, valid.astype(np.float64))
+            n_trailing = int(np.prod(shape[1:]))
+            flat_index = (bin_index.reshape(-1, 1) * n_trailing + np.arange(n_trailing)).ravel()
+            for key, term in (('u', np.where(valid, u, 0.0)), ('v', np.where(valid, v, 0.0)), ('n', valid)):
+                totals[key] += np.bincount(
+                    flat_index, weights=term.astype(np.float64).ravel(), minlength=totals[key].size
+                ).reshape(shape)
 
         counts = np.where(totals['n'] > 0, totals['n'], np.nan)
         return times, totals['u'] / counts, totals['v'] / counts
@@ -1178,44 +1297,137 @@ class CWEX:
         return result
 
     def wake_candidates(
-            self, *, 
+            self,
+            turbine: str|list[str] = 'B2',
+            *,
+            station: int|str = 'all',
             wake_width_deg: float = 5.0,
-            station: int|str = 'all', 
-            t_min: np.datetime64|None = None,
-            t_max: np.datetime64|None = None, 
+            wake_model: Literal['frustum', 'wedge'] = 'frustum',
+            max_distance_m: float|None = None,
+            direction_source: str = 'weather-vane',
+            detection_averaging: str|np.timedelta64 = '30m',
             speed_lower_bound: float|None = None,
             speed_upper_bound: float|None = None,
-            return_type: Literal['indices', 'times'] = 'indices'
-    ) -> np.ndarray:
+            t_min: np.datetime64|None = None,
+            t_max: np.datetime64|None = None
+    ) -> WakeCandidates:
         '''
-        Times for which it was likely a wind wake passed over the given tower. 
-        Candidates are determined based on the wind direction (and speed at the tower if requested).
+        Periods in which towers may lie in the wake of a turbine.
+
+        A tower is a candidate in an averaging bin when, for the mean wind direction, it lies inside
+        the wake of a turbine, and the mean speed lies within any bounds given. Bins with no wind data
+        are not candidates. See `plot_wake_geometry` to view the wakes on a map.
 
         Parameters
         ----------
-        wake_width_deg : float, optional
-            The assumed spread of the wake in degrees. Defaults to 5.0 deg, as 
-            per https://journals.ametsoc.org/view/journals/atot/27/8/2010jtecha1398_1.xml.
+        turbine : str or list of str, optional
+            A turbine id, a list of ids, or 'all'. A tower is a candidate if any of them applies.
+            Defaults to 'B2', the turbine in line with the towers.
         station : int or str, optional
-            The station number or name. Defaults to 'all'.
-        t_min : np.datetime64 or None, optional
-            The minimum time to consider. Defaults to None.
-        t_max : np.datetime64 or None, optional
-            The maximum time to consider. Defaults to None.
-        speed_lower_bound : float or None, optional
-            The lower bound on wind speed. Defaults to None.
-        speed_upper_bound : float or None, optional
-            The upper bound on wind speed. Defaults to None.
-        return_type : {'indices', 'times'}, optional
-            Whether to return the indices of the candidate times as a boolean array (default) 
-            or the timestamps themselves.
-        
+            A station name, a 1-based index, or 'all' (default).
+        wake_width_deg : float, optional
+            The full angle at which the wake spreads downwind, in degrees. Defaults to 5.0, as per
+            https://journals.ametsoc.org/view/journals/atot/27/8/2010jtecha1398_1.xml.
+        wake_model : {'frustum', 'wedge'}, optional
+            The wake shape. 'frustum' (default) starts as wide as the rotor (`turbine_rotor_diameter_m`)
+            and spreads at `wake_width_deg`. 'wedge' spreads at `wake_width_deg` from a point at the turbine.
+        max_distance_m : float or None, optional
+            If given, turbines farther than this from a tower are ignored for that tower.
+        direction_source : str, optional
+            The wind measurement used for detection: 'weather-vane' (default, 10 m) or
+            'sonic-anemometer' (4.5 m). Accepts 'vane' and 'sonic' as shorthand. Reanalysis
+            datasets are not yet supported.
+        detection_averaging : str or np.timedelta64, optional
+            The averaging bin length for detection. Defaults to '30m'.
+        speed_lower_bound, speed_upper_bound : float or None, optional
+            Bounds on the mean wind speed at the instrument's height, in m/s. Defaults to None.
+        t_min, t_max : np.datetime64 or None, optional
+            The window to detect over. If None (default), the start or end of the experiment.
+
         Returns
         -------
-        np.ndarray
-            The indices or timestamps for which a wake was likely present.
+        WakeCandidates
+            The candidate mask on the averaging bins, with the direction and speed used.
+
+        Raises
+        ------
+        NotImplementedError
+            If `direction_source` is a reanalysis dataset.
         '''
-        raise NotImplementedError("wake_candidates() is not yet implemented.")
+        turbines = self._resolve_turbines(turbine)
+
+        source = direction_source.lower().replace('_', '-').replace(' ', '-')
+        if source in DATASETS:
+            raise NotImplementedError(f"direction_source='{direction_source}' is not yet supported. Use 'weather-vane' or 'sonic-anemometer'.")
+        if source not in self._instrument_aliases:
+            raise ValueError(f"Invalid direction_source '{direction_source}'. Must be one of {list(self._instrument_aliases)}.")
+        source = self._instrument_aliases[source]
+        u_var, v_var = ('U_10m', 'V_10m') if source == 'weather-vane' else ('u_4_5m', 'v_4_5m')
+
+        if wake_width_deg <= 0:
+            raise ValueError(f"wake_width_deg must be positive, got {wake_width_deg}.")
+        rotor_diameter_m = self._wake_rotor_diameter(wake_model)
+
+        times, east, north = self._binned_components(
+            u_var, v_var, station=station, t_min=t_min, t_max=t_max, time_averaging=detection_averaging
+        )
+        index = self._station_index(station)
+        if not isinstance(index, slice):
+            east, north = east[:, None], north[:, None]
+        stations = self.stations[index] if isinstance(index, slice) else (self.stations[index],)
+
+        direction = np.degrees(np.arctan2(-east, -north)) % 360
+        speed = np.hypot(east, north)
+
+        allowed = np.ones(direction.shape, dtype=bool)
+        if speed_lower_bound is not None:
+            allowed &= speed >= speed_lower_bound
+        if speed_upper_bound is not None:
+            allowed &= speed <= speed_upper_bound
+
+        by_turbine = np.zeros(direction.shape + (len(turbines),), dtype=bool)
+        for k, name in enumerate(turbines):
+            unit, distances = self._tower_offsets(name)
+            bearing = (np.degrees(np.arctan2(unit[:, 0], unit[:, 1])) % 360)[index]
+            near = np.ones(len(stations), dtype=bool) if max_distance_m is None else np.atleast_1d(distances[index] <= max_distance_m)
+            by_turbine[..., k] = in_wake(
+                direction, np.atleast_1d(bearing), wake_width_deg,
+                distance_m=np.atleast_1d(distances[index]), rotor_diameter_m=rotor_diameter_m
+            ) & allowed & near
+
+        return WakeCandidates(
+            times=times,
+            period=pd.Timedelta(detection_averaging).to_timedelta64().astype('timedelta64[ns]'),
+            stations=tuple(stations),
+            turbines=tuple(turbines),
+            by_turbine=by_turbine,
+            direction=direction,
+            speed=speed,
+            criteria={
+                'wake_width_deg': wake_width_deg, 'wake_model': wake_model.lower(),
+                'rotor_diameter_m': rotor_diameter_m, 'max_distance_m': max_distance_m,
+                'direction_source': source, 'detection_averaging': detection_averaging,
+                'speed_lower_bound': speed_lower_bound, 'speed_upper_bound': speed_upper_bound,
+            }
+        )
+
+    def _wake_rotor_diameter(self, wake_model: str) -> float|None:
+        '''The rotor diameter `in_wake` needs for a wake model: the turbines' for 'frustum', None for 'wedge'.'''
+        wake_model = wake_model.lower()
+        if wake_model not in ('frustum', 'wedge'):
+            raise ValueError(f"Invalid wake_model '{wake_model}'. Must be 'frustum' or 'wedge'.")
+        return self.turbine_rotor_diameter_m if wake_model == 'frustum' else None
+
+    def _resolve_turbines(self, turbine: str|list[str]) -> list[str]:
+        '''Turn a turbine id, list of ids or 'all' into a validated list of ids.'''
+        if isinstance(turbine, str):
+            turbines = list(self.turbines.index) if turbine.lower() == 'all' else [turbine.upper()]
+        else:
+            turbines = [t.upper() for t in turbine]
+        invalid = [t for t in turbines if t not in self.turbines.index]
+        if invalid:
+            raise ValueError(f"Invalid turbine(s) {invalid}. Must be from {list(self.turbines.index)}, or 'all'.")
+        return turbines
 
     @staticmethod
     def downwind_components(
@@ -1340,7 +1552,8 @@ class CWEX:
     def _station_snapshot(
             self, var_name: str, *,
             t_min: np.datetime64, t_max: np.datetime64,
-            time_averaging: str|np.timedelta64|None = '30m'
+            time_averaging: str|np.timedelta64|None = '30m',
+            wake_candidates: bool|WakeCandidates = False
     ) -> np.ndarray:
         '''
         Reduce a variable to a single value per station over a time window.
@@ -1353,6 +1566,8 @@ class CWEX:
             The window to average over.
         time_averaging : str or np.timedelta64 or None, optional
             Passed through to `timeseries`.
+        wake_candidates : bool or WakeCandidates, optional
+            Passed through to `timeseries`.
 
         Returns
         -------
@@ -1361,7 +1576,7 @@ class CWEX:
         '''
         values = self.timeseries(
             var_name, sample='all', station='all', return_type='data_with_nan',
-            t_min=t_min, t_max=t_max, time_averaging=time_averaging
+            t_min=t_min, t_max=t_max, time_averaging=time_averaging, wake_candidates=wake_candidates
         )
 
         sample_axis = self._sample_axis(var_name, sample='all', station='all')
@@ -1502,7 +1717,8 @@ class CWEX:
             r_ticks: list|None = None,
             title: str|None = None,
             ax: plt.Axes|None = None,
-            return_fig: bool = False
+            return_fig: bool = False,
+            wake_candidates: bool|WakeCandidates = False
     ) -> plt.Axes|tuple[plt.Figure, plt.Axes]:
         '''
         Draw one station's wind rose: a polar histogram of direction, stacked by speed bin.
@@ -1543,12 +1759,16 @@ class CWEX:
             A polar axes to draw into. If None, one is created.
         return_fig : bool, optional
             If True, return the Figure and Axes. Defaults to False.
+        wake_candidates : bool or WakeCandidates, optional
+            Restrict to periods of likely turbine wakes. See `timeseries`. Defaults to False.
 
         Returns
         -------
         matplotlib.axes.Axes or matplotlib.figure.Figure
         '''
         label = self._station_label(station)
+        if wake_candidates is not False:
+            label = f'{label} (wake candidates)'
 
         if speed_bins is None:
             speed_bins = np.arange(0, 20, 2)
@@ -1563,7 +1783,8 @@ class CWEX:
 
         direction, speed = self.wind(
             station=station, instrument=instrument, samples=samples,
-            t_min=t_min, t_max=t_max, time_averaging=time_averaging, units='deg'
+            t_min=t_min, t_max=t_max, time_averaging=time_averaging, units='deg',
+            wake_candidates=wake_candidates
         )
 
         valid = np.isfinite(direction) & np.isfinite(speed)
@@ -1615,6 +1836,135 @@ class CWEX:
 
         return (ax.figure, ax) if return_fig else ax
 
+    def plot_wake_candidates(
+            self,
+            station: int|str,
+            *,
+            wake_candidates: WakeCandidates|None = None,
+            t_min: np.datetime64|None = None,
+            t_max: np.datetime64|None = None,
+            speed_bins: np.ndarray|None = None,
+            cmap: str = 'turbo',
+            colour_other: str = 'tab:blue',
+            alpha_other: float = 0.3,
+            colour_candidate: str = 'tab:red',
+            alpha_candidate: float = 1.0,
+            r_max: float|None = None,
+            legend: bool = True,
+            title: str|None = None,
+            ax: plt.Axes|None = None,
+            return_fig: bool = False
+    ) -> plt.Axes|tuple[plt.Figure, plt.Axes]:
+        '''
+        Draw one station's wind as a polar scatter of direction against speed, shading each
+        turbine's wake sector and colouring the wake candidates by speed.
+
+        A sector holds the wind directions that put the station inside that turbine's wake, so its
+        width depends on the wake model and, for 'frustum', on the station's distance from the turbine.
+        Points are the averaging bins used for detection, so every candidate lies inside a sector.
+
+        Parameters
+        ----------
+        station : int or str
+            The station to plot, as a name or 1-based index. 'all' is not accepted.
+        wake_candidates : WakeCandidates or None, optional
+            The candidates to draw. Must cover `station`. If None (default), `wake_candidates()`
+            is run with its defaults for this station over `t_min`/`t_max`.
+        t_min, t_max : np.datetime64 or None, optional
+            The window to detect over when `wake_candidates` is None. Ignored otherwise.
+        speed_bins : np.ndarray or None, optional
+            Speed bin edges for the candidate colours, in m/s. Defaults to 2 m/s bins from 0 to 18,
+            matching `plot_windrose`.
+        cmap : str, optional
+            The colourmap sampled for the speed bins. Defaults to 'turbo'.
+        colour_other : str, optional
+            The colour of bins that are not candidates. Defaults to 'darkgrey'.
+        alpha_other : float, optional
+            The alpha of bins that are not candidates. Defaults to 0.3.
+        colour_candidate : str, optional
+            The colour of the wake sectors and candidates. Defaults to 'tab:red'.
+        alpha_candidate : float, optional
+            The alpha of the wake sectors and candidates. Defaults to 1.0.
+        r_max : float or None, optional
+            The radial (speed) limit in m/s. If None (default), just above the fastest bin.
+        legend : bool, optional
+            If True (default), label the candidates, other bins and sectors.
+        title : str or None, optional
+            The axes title. Defaults to the station name.
+        ax : matplotlib.axes.Axes or None, optional
+            A polar axes to draw into. If None, one is created.
+        return_fig : bool, optional
+            If True, return the Figure and Axes. Defaults to False.
+
+        Returns
+        -------
+        matplotlib.axes.Axes or tuple of (matplotlib.figure.Figure, matplotlib.axes.Axes)
+        '''
+        label = self._station_label(station)
+        wake = self._resolve_wake(
+            True if wake_candidates is None else wake_candidates, station=station, t_min=t_min, t_max=t_max
+        )
+
+        i = wake.stations.index(label)
+        direction, speed, candidate = wake.direction[:, i], wake.speed[:, i], wake.mask[:, i]
+        other = np.isfinite(direction) & np.isfinite(speed) & ~candidate
+        theta = np.radians(direction)
+
+        if ax is None:
+            _, ax = plt.subplots(figsize=(6, 6), subplot_kw={'projection': 'polar'})
+
+        ax.set_theta_zero_location('N')
+        ax.set_theta_direction(-1)  # clockwise - meteorological convention
+
+        top = r_max if r_max is not None else (
+            1.05 * np.nanmax(speed) if np.isfinite(speed).any() else 1.0
+        )
+        lower = wake.criteria.get('speed_lower_bound') or 0.0
+        upper = top if wake.criteria.get('speed_upper_bound') is None else min(wake.criteria['speed_upper_bound'], top)
+        max_distance_m = wake.criteria.get('max_distance_m')
+
+        station_index = self.stations.index(label)
+        for name in wake.turbines:
+            unit, distances = self._tower_offsets(name)
+            if max_distance_m is not None and distances[station_index] > max_distance_m:
+                continue
+            bearing = np.arctan2(unit[station_index, 0], unit[station_index, 1])
+            sector_width = 2 * np.radians(wake_half_angle(
+                wake.criteria['wake_width_deg'], distances[station_index], wake.criteria.get('rotor_diameter_m')
+            ))
+            ax.bar(bearing, upper - lower, width=sector_width, bottom=lower,
+                   color=colour_candidate, alpha=0.2, linewidth=0, zorder=1)
+            ax.text(bearing, top, name, ha='center', va='bottom', fontsize=8, color=colour_candidate)
+
+        ax.scatter(theta[other], speed[other], s=1, alpha=alpha_other, color=colour_other)
+
+        speed_map, speed_norm = self.speed_colourmap(speed_bins, cmap)
+        ax.scatter(
+            theta[candidate], speed[candidate], color=colour_candidate, cmap=speed_map, norm=speed_norm,
+            s=2, zorder=3, alpha=alpha_candidate
+        )
+
+        ax.set_ylim(0, top)
+        ax.set_xticks(np.radians(np.arange(0, 360, 45)))
+        ax.set_xticklabels(['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'])
+        ax.set_rlabel_position(280)
+        ax.set_title(title if title is not None else label, pad=15)
+
+        if legend:
+            ax.legend(
+                handles=[
+                    plt.Line2D([], [], linestyle='none', marker='o', markersize=2, markerfacecolor=colour_candidate,
+                               label=f'Wake candidate (n={int(candidate.sum())})'),
+                    plt.Line2D([], [], linestyle='none', marker='o', markersize=1, color=colour_other,
+                               label=f'Other (n={int(other.sum())})'),
+                    plt.Rectangle((0, 0), 1, 1, color=colour_candidate, alpha=0.2,
+                                  label=f'Wake sector ({wake.criteria.get("wake_model", "wedge")}, {wake.criteria["wake_width_deg"]:g}°)'),
+                ],
+                loc='upper left', bbox_to_anchor=(1.02, 1.0), fontsize=8, frameon=False
+            )
+
+        return (ax.figure, ax) if return_fig else ax
+
     def plot_tke(
             self,
             station: int|str,
@@ -1625,7 +1975,8 @@ class CWEX:
             gap_shading: bool = True,
             title: str|None = None,
             ax: plt.Axes|None = None,
-            return_fig: bool = False
+            return_fig: bool = False,
+            wake_candidates: bool|WakeCandidates = False
     ) -> plt.Axes|tuple[plt.Figure, plt.Axes]:
         '''
         Draw one station's TKE timeseries, shading the gaps where data is missing.
@@ -1642,26 +1993,32 @@ class CWEX:
         colour : str, optional
             The marker colour. Defaults to 'tab:blue'.
         gap_shading : bool, optional
-            If True (default), shade the periods with no data in grey.
+            If True (default), shade the periods with no data in grey. With `wake_candidates`,
+            periods outside the candidates are shaded too.
         title : str or None, optional
             The axes title. Defaults to the station name.
         ax : matplotlib.axes.Axes or None, optional
             The axes to draw into. If None, one is created.
         return_fig : bool, optional
             If True, return the Figure and Axes. Defaults to False.
+        wake_candidates : bool or WakeCandidates, optional
+            Restrict to periods of likely turbine wakes. See `timeseries`. Defaults to False.
 
         Returns
         -------
         matplotlib.axes.Axes or matplotlib.figure.Figure
         '''
         label = self._station_label(station)
+        if wake_candidates is not False:
+            label = f'{label} (wake candidates)'
 
         if ax is None:
             _, ax = plt.subplots(figsize=(10, 3))
 
         time, tke = self.tke(
             station=station,
-            t_min=t_min, t_max=t_max, return_time=True
+            t_min=t_min, t_max=t_max, return_time=True,
+            wake_candidates=wake_candidates
         )
 
         ax.scatter(time, tke, marker='.', s=1, alpha=0.5, linewidth=0.25, color=colour)
@@ -1709,7 +2066,8 @@ class CWEX:
             figsize: tuple[float, float] = (7, 8),
             title: str|None = None,
             ax: plt.Axes|None = None,
-            return_fig: bool = False
+            return_fig: bool = False,
+            wake_candidates: bool|WakeCandidates = False
     ) -> plt.Axes|tuple[plt.Figure, plt.Axes]:
         '''
         Map the towers and turbines, with an arrow from each tower showing the wind at a moment.
@@ -1776,6 +2134,9 @@ class CWEX:
             The axes to draw into. If None, one is created.
         return_fig : bool, optional
             If True, return the Figure and Axes. Defaults to False.
+        wake_candidates : bool or WakeCandidates, optional
+            Restrict the arrows and `colour_by` values to periods of likely turbine wakes, for
+            every station. See `timeseries`. Defaults to False.
 
         Returns
         -------
@@ -1784,6 +2145,8 @@ class CWEX:
         t_min, t_max, window_label = self._resolve_window(
             time, t_min=t_min, t_max=t_max, time_averaging=time_averaging
         )
+        wake = self._resolve_wake(wake_candidates, station='all', t_min=t_min, t_max=t_max)
+        wake_kwarg = False if wake is None else wake
 
         crs = self.plotting_crs if crs is None else crs
         crs_info = gpd.GeoSeries([], crs=crs).crs
@@ -1802,7 +2165,8 @@ class CWEX:
 
         direction, speed = self.wind(
             station='all', instrument=instrument, samples='mean',
-            t_min=t_min, t_max=t_max, time_averaging=time_averaging, units='deg'
+            t_min=t_min, t_max=t_max, time_averaging=time_averaging, units='deg',
+            wake_candidates=wake_kwarg
         )
         direction = np.atleast_2d(direction)
         speed = np.atleast_2d(speed)
@@ -1816,7 +2180,7 @@ class CWEX:
 
         # tower markers, optionally carrying a variable
         values = self._station_snapshot(
-            colour_by, t_min=t_min, t_max=t_max, time_averaging=time_averaging
+            colour_by, t_min=t_min, t_max=t_max, time_averaging=time_averaging, wake_candidates=wake_kwarg
         ) if colour_by is not None else None
 
         marker_mappable = None
@@ -1895,8 +2259,181 @@ class CWEX:
 
         if title is None:
             title = f'{instrument} — {window_label}'
+            if wake is not None:
+                title = f'{title} (wake candidates)'
             if not has_wind.any():
                 title = f'{title} — no wind data'
+        ax.set_title(title)
+
+        return (ax.figure, ax) if return_fig else ax
+
+    def plot_wake_geometry(
+            self,
+            direction: float,
+            turbine: str|list[str] = 'B2',
+            *,
+            wake_width_deg: float = 5.0,
+            wake_model: Literal['frustum', 'wedge'] = 'frustum',
+            max_distance_m: float|None = None,
+            rotor: bool = True,
+            colour_wake: str = 'tab:red',
+            colour_towers: str = 'tab:green',
+            colour_turbines: str = 'tab:blue',
+            colour_arrows: str = 'black',
+            arrow_length: float = 150,
+            annotate: bool = True,
+            scale_bar: bool = True,
+            legend: bool = True,
+            crs: str|None = None,
+            pad: float = 300,
+            figsize: tuple[float, float] = (7, 8),
+            title: str|None = None,
+            ax: plt.Axes|None = None,
+            return_fig: bool = False
+    ) -> plt.Axes|tuple[plt.Figure, plt.Axes]:
+        '''
+        Map the wakes that `wake_candidates` assumes for a given wind direction.
+
+        Each wake starts at a turbine and spreads downwind at a full angle of `wake_width_deg`, from the
+        width of the rotor ('frustum') or from a point ('wedge'). Towers flagged as wake candidates for
+        this direction are outlined in `colour_wake`; they are exactly the towers lying inside a wake.
+
+        Parameters
+        ----------
+        direction : float
+            Meteorological wind direction (the direction the wind blows from) in degrees.
+        turbine : str or list of str, optional
+            A turbine id, a list of ids, or 'all'. Defaults to 'B2'.
+        wake_width_deg : float, optional
+            The full angle at which each wake spreads, in degrees. Defaults to 5.0.
+        wake_model : {'frustum', 'wedge'}, optional
+            The wake shape, as in `wake_candidates`. Defaults to 'frustum'.
+        max_distance_m : float or None, optional
+            If given, towers farther than this from a turbine are not counted as in its wake.
+        rotor : bool, optional
+            If True (default), draw each turbine's rotor diameter across the wind, for comparison
+            with the wedge width.
+        colour_wake, colour_towers, colour_turbines, colour_arrows : str, optional
+            Colours of the wedges and candidate outlines, the tower markers, the turbine markers
+            and the wind arrows.
+        arrow_length : float, optional
+            Length of the wind arrow drawn at each tower, in metres. Defaults to 150.
+        annotate : bool, optional
+            If True (default), label each tower, and give the wedge width at each candidate tower.
+        scale_bar : bool, optional
+            If True (default), add a scale bar.
+        legend : bool, optional
+            If True (default), label the markers and wedges.
+        crs : str or None, optional
+            The CRS to draw in. Must be projected in metres. Defaults to `self.plotting_crs`.
+        pad : float, optional
+            Metres of margin around the locations. Defaults to 300.
+        figsize : tuple of float, optional
+            Figure size, used only when `ax` is None.
+        title : str or None, optional
+            The axes title. Defaults to the wind direction and turbines.
+        ax : matplotlib.axes.Axes or None, optional
+            The axes to draw into. If None, one is created.
+        return_fig : bool, optional
+            If True, return the Figure and Axes. Defaults to False.
+
+        Returns
+        -------
+        matplotlib.axes.Axes or tuple of (matplotlib.figure.Figure, matplotlib.axes.Axes)
+        '''
+        turbines = self._resolve_turbines(turbine)
+        rotor_diameter_m = self._wake_rotor_diameter(wake_model)
+        start_half_width = 0.0 if rotor_diameter_m is None else rotor_diameter_m / 2
+
+        crs = self.plotting_crs if crs is None else crs
+        if not gpd.GeoSeries([], crs=crs).crs.is_projected:
+            raise ValueError(f"plot_wake_geometry needs a projected CRS in metres, but got '{crs}', which is geographic.")
+
+        towers = self.towers.reindex(list(self.stations)).to_crs(crs)
+        all_turbines = self.turbines.to_crs(crs)
+        x, y = towers.geometry.x.to_numpy(), towers.geometry.y.to_numpy()
+
+        bounds = pd.concat([towers, all_turbines]).total_bounds
+        reach = np.hypot(bounds[2] - bounds[0], bounds[3] - bounds[1]) + 2 * pad
+
+        if ax is None:
+            _, ax = plt.subplots(figsize=figsize)
+
+        downwind = np.radians(direction + 180)
+        along = np.array([np.sin(downwind), np.cos(downwind)])
+        across = np.array([np.cos(downwind), -np.sin(downwind)])
+        spread = np.tan(np.radians(wake_width_deg / 2))
+        wake_width_at = {}  # (station, turbine) -> wake width at the tower, in metres
+
+        for name in turbines:
+            tx, ty = all_turbines.loc[name, 'geometry'].x, all_turbines.loc[name, 'geometry'].y
+            far_half_width = start_half_width + reach * spread
+            corners = np.array([
+                [tx, ty] - start_half_width * across,
+                [tx, ty] + reach * along - far_half_width * across,
+                [tx, ty] + reach * along + far_half_width * across,
+                [tx, ty] + start_half_width * across,
+            ])
+            ax.fill(corners[:, 0], corners[:, 1], color=colour_wake, alpha=0.2, linewidth=0, zorder=1)
+
+            if rotor:
+                r = self.turbine_rotor_diameter_m / 2
+                ax.plot([tx - r * across[0], tx + r * across[0]], [ty - r * across[1], ty + r * across[1]],
+                        color=colour_turbines, linewidth=1.5, zorder=2)
+
+            unit, distances = self._tower_offsets(name)
+            bearing = np.degrees(np.arctan2(unit[:, 0], unit[:, 1])) % 360
+            inside = in_wake(direction, bearing, wake_width_deg, distance_m=distances, rotor_diameter_m=rotor_diameter_m)
+            if max_distance_m is not None:
+                inside &= distances <= max_distance_m
+            downwind_distance = -distances * (unit @ along)
+            for j in np.flatnonzero(inside):
+                wake_width_at[(self.stations[j], name)] = 2 * (start_half_width + downwind_distance[j] * spread)
+
+        all_turbines.plot(ax=ax, color=colour_turbines, marker='1', markersize=100, linewidth=0.75, zorder=3)
+
+        candidate = np.array([any(s == station for s, _ in wake_width_at) for station in self.stations])
+        ax.scatter(x[~candidate], y[~candidate], color=colour_towers, marker='^', s=60,
+                   edgecolor='black', linewidth=0.5, zorder=4)
+        ax.scatter(x[candidate], y[candidate], color=colour_towers, marker='^', s=90,
+                   edgecolor=colour_wake, linewidth=2, zorder=4)
+
+        east, north = self.downwind_components(np.full(len(x), direction))
+        ax.quiver(x, y, east * arrow_length, north * arrow_length, color=colour_arrows,
+                  angles='xy', scale_units='xy', scale=1, pivot='tail',
+                  width=0.004, headwidth=4, headlength=5, headaxislength=4.5, zorder=3)
+
+        if annotate:
+            for station, x_i, y_i in zip(self.stations, x, y):
+                lines = [station] + [f'{name} wake: {width:.0f} m wide' for (s, name), width in wake_width_at.items() if s == station]
+                ax.annotate('\n'.join(lines), (x_i, y_i), textcoords='offset points', xytext=(8, 0),
+                            ha='left', va='center', fontsize=8, zorder=5)
+
+        if legend:
+            handles = [
+                plt.Line2D([], [], linestyle='none', marker='^', markersize=7, markerfacecolor=colour_towers,
+                           markeredgecolor='black', label='Eddy tower'),
+                plt.Line2D([], [], linestyle='none', marker='^', markersize=8, markerfacecolor=colour_towers,
+                           markeredgecolor=colour_wake, markeredgewidth=2, label='Wake candidate'),
+                plt.Line2D([], [], linestyle='none', marker='1', markersize=10, color=colour_turbines,
+                           label='Wind turbine'),
+                plt.Rectangle((0, 0), 1, 1, color=colour_wake, alpha=0.2, label=f'Wake ({wake_model.lower()}, {wake_width_deg:g}°)'),
+            ]
+            if rotor:
+                handles.append(plt.Line2D([], [], color=colour_turbines, linewidth=1.5,
+                                          label=f'Rotor ({self.turbine_rotor_diameter_m:g} m)'))
+            ax.legend(handles=handles, loc='best', fontsize=9, frameon=True, fancybox=True, framealpha=0.5)
+
+        ax.set_xlim(bounds[0] - pad, bounds[2] + pad)
+        ax.set_ylim(bounds[1] - pad, bounds[3] + pad)
+        ax.set_aspect('equal')
+        ax.set_axis_off()
+
+        if scale_bar:
+            ax.add_artist(ScaleBar(1, location='lower right'))
+
+        if title is None:
+            title = f'Wind from {direction:g}° — wakes from {", ".join(turbines) if len(turbines) <= 4 else "all turbines"}'
         ax.set_title(title)
 
         return (ax.figure, ax) if return_fig else ax

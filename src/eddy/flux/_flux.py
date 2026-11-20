@@ -1,4 +1,6 @@
-__all__ = ['CovarianceAccumulator']
+__all__ = ['CovarianceAccumulator', 'WakeCandidates', 'in_wake', 'wake_half_angle']
+
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -192,3 +194,157 @@ class CovarianceAccumulator:
 
     def __repr__(self):
         return f'{type(self).__name__}(shape={self.shape}, samples={self.sums["n"].sum():.0f})'
+
+
+def wake_half_angle(
+        width_deg: float, distance_m: np.ndarray|float|None = None, rotor_diameter_m: float|None = None
+    ) -> np.ndarray|float:
+    '''
+    Half the angle, seen from the wake source, within which the wind must blow towards a tower for the tower to lie in the wake.
+
+    Without a rotor diameter the wake is a wedge from a point, so this is `width_deg / 2`. With one it is a
+    frustum: the wake starts as wide as the rotor and spreads at `width_deg`, so nearer towers have wider angles.
+
+    Parameters
+    ----------
+    width_deg : float
+        Full spreading angle of the wake in degrees.
+    distance_m : np.ndarray or float or None, optional
+        Distance from the turbine to the tower in metres. Required with `rotor_diameter_m`.
+    rotor_diameter_m : float or None, optional
+        Rotor diameter in metres. If None (default), the wake is a wedge.
+
+    Returns
+    -------
+    np.ndarray or float
+        The half-angle in degrees, at most 90.
+    '''
+    half = width_deg / 2
+    if rotor_diameter_m is None:
+        return half
+    if distance_m is None:
+        raise ValueError("distance_m is required with rotor_diameter_m.")
+
+    ratio = rotor_diameter_m * np.cos(np.radians(half)) / (2 * np.asarray(distance_m, dtype=np.float64))
+    return np.minimum(half + np.degrees(np.arcsin(np.minimum(ratio, 1.0))), 90.0)
+
+
+def in_wake(
+        direction: np.ndarray,
+        bearing: np.ndarray|float,
+        width_deg: float,
+        *,
+        distance_m: np.ndarray|float|None = None,
+        rotor_diameter_m: float|None = None
+    ) -> np.ndarray:
+    '''
+    Whether a tower lies in the wake of a turbine, given the wind direction.
+
+    The wake opens downwind from the turbine at a full angle of `width_deg`. With `rotor_diameter_m` it starts as
+    wide as the rotor (a frustum); without, it starts from a point (a wedge). See `wake_half_angle`.
+
+    Parameters
+    ----------
+    direction : np.ndarray
+        Meteorological wind direction (the direction the wind blows from) in degrees.
+    bearing : np.ndarray or float
+        Bearing from the tower to the turbine in degrees, clockwise from north. Broadcasts against `direction`.
+    width_deg : float
+        Full spreading angle of the wake in degrees.
+    distance_m : np.ndarray or float or None, optional
+        Distance from the tower to the turbine in metres, broadcasting like `bearing`. Required with `rotor_diameter_m`.
+    rotor_diameter_m : float or None, optional
+        Rotor diameter in metres. If None (default), the wake is a wedge.
+
+    Returns
+    -------
+    np.ndarray
+        Boolean array, False where `direction` is NaN.
+    '''
+    half = wake_half_angle(width_deg, distance_m, rotor_diameter_m)
+    with np.errstate(invalid='ignore'):
+        offset = (np.asarray(direction) - bearing + 180) % 360 - 180
+        return np.abs(offset) <= half
+
+
+@dataclass(frozen=True)
+class WakeCandidates:
+    '''
+    Periods in which towers may lie in the wake of a turbine, on a grid of fixed-length,
+    epoch-anchored time bins.
+
+    Attributes
+    ----------
+    times : np.ndarray
+        The start of each bin, shape (n_bins,).
+    period : np.timedelta64
+        The bin length.
+    stations : tuple of str
+        The stations covered, in the order of the station axis.
+    turbines : tuple of str
+        The turbines considered, in the order of the turbine axis.
+    by_turbine : np.ndarray
+        Boolean, shape (n_bins, n_stations, n_turbines). True where a station may be in the wake of that turbine.
+    direction, speed : np.ndarray
+        The wind direction (degrees) and speed used for detection, shape (n_bins, n_stations).
+    criteria : dict
+        The settings used for detection.
+
+    Methods
+    -------
+    at(times, station='all')
+        The candidate mask at arbitrary timestamps.
+    '''
+    times: np.ndarray
+    period: np.timedelta64
+    stations: tuple[str, ...]
+    turbines: tuple[str, ...]
+    by_turbine: np.ndarray
+    direction: np.ndarray
+    speed: np.ndarray
+    criteria: dict
+
+    @property
+    def mask(self) -> np.ndarray:
+        '''True where a station may be in the wake of any turbine, shape (n_bins, n_stations).'''
+        return self.by_turbine.any(axis=-1)
+
+    def at(self, times: np.ndarray, station: str = 'all') -> np.ndarray:
+        '''
+        The candidate mask at arbitrary timestamps, from the bin each falls in.
+
+        Parameters
+        ----------
+        times : np.ndarray
+            Timestamps, as datetime64.
+        station : str, optional
+            A station name, or 'all' (default) for every station covered.
+
+        Returns
+        -------
+        np.ndarray
+            Boolean, shape (len(times), n_stations) for 'all' or (len(times),) for a single station.
+            Timestamps outside the bins are False.
+
+        Raises
+        ------
+        ValueError
+            If `station` is not covered.
+        '''
+        if station.lower() == 'all':
+            mask = self.mask
+        elif station.upper() in self.stations:
+            mask = self.mask[:, self.stations.index(station.upper())]
+        else:
+            raise ValueError(f"Station '{station}' is not covered by these wake candidates, which cover {self.stations}.")
+
+        period_ns = np.timedelta64(self.period, 'ns').astype('int64')
+        first_bin = self.times[:1].astype('datetime64[ns]').astype('int64') // period_ns
+        bin_index = np.asarray(times).astype('datetime64[ns]').astype('int64') // period_ns - first_bin
+        inside = (bin_index >= 0) & (bin_index < len(self.times))
+
+        out = mask[np.where(inside, bin_index, 0)] if len(self.times) else np.zeros((len(bin_index),) + mask.shape[1:], dtype=bool)
+        return out & inside.reshape(inside.shape + (1,) * (out.ndim - 1))
+
+    def __repr__(self):
+        return f'{type(self).__name__}(stations={self.stations}, turbines={self.turbines}, n_bins={len(self.times)}, n_candidates={self.mask.sum(axis=0).tolist()})'

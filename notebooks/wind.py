@@ -53,18 +53,12 @@ def _():
     import xyzservices.providers as xyz
     from dotenv import load_dotenv
     load_dotenv()
-    return Literal, folium, mo, np, plt
+    return folium, mo, np, plt
 
 
 @app.cell
 def _():
     import eddy
-
-    # get dirs too
-    from eddy.flux.data import FLUX_DIR, FLUXNET_DIR, TERN_DIR, AMERIFLUX_DIR
-    from eddy.util import DATA_DIR, OUT_DIR
-    from eddy.util import standardise_df
-
 
     return (eddy,)
 
@@ -158,7 +152,7 @@ def _(mo):
 
 
 @app.cell
-def _(GDF_COUNTRIES, eddy, gdf_fluxnet, gdf_wind, mo, plt):
+def _(GDF_COUNTRIES, eddy, gdf_fluxnet, gdf_wind, mo, np, plt):
     match_dist = 35_000  # m
     min_years = 2
 
@@ -176,8 +170,14 @@ def _(GDF_COUNTRIES, eddy, gdf_fluxnet, gdf_wind, mo, plt):
         figsize = (15, 7)
     )
 
-    _fig, _ax_hist  = plt.subplots(1,1, figsize = (7,5))
-    (gdf_matches['dist_m']/1000).plot.hist(bins = 250, ax = _ax_hist)
+    _fig, _ax_hist  = plt.subplots(1,1, figsize = (6,4))
+    _hist, _bins = np.histogram((gdf_matches['dist_m']/1000), bins=35)
+    _ax_hist.bar(_bins[:-1], _hist.cumsum(), width = np.diff(_bins), 
+                   edgecolor = 'black', align = 'edge', alpha = 0.7, linewidth = 0.7)
+    _ax_hist.grid()
+    _ax_hist.set_ylabel('Cumulative count')
+    _ax_hist.set_xlabel('Distance (km)')
+    _ax_hist
 
 
     mo.vstack([
@@ -243,7 +243,6 @@ def _(GDF_COUNTRIES, eddy, gdf_matches, mo):
             max_dist_m = ('dist_m', 'max')
         )
     ])
-
     return
 
 
@@ -283,7 +282,7 @@ def _(fs_de_ruc):
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    #### 1.2 Local wind data
+    #### 1.2 Local turbine data
     """)
     return
 
@@ -291,6 +290,8 @@ def _(mo):
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
+    Local sources may contain smaller plants (e.g. single turbines), which increase the likelihood of a match.
+
     Sources:
     - **Germany**: MaStR
     - **US**: Wind Turbine Database?
@@ -500,6 +501,14 @@ def _(mo):
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
+    #### 2.1. CWEX - what would this look like?
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
     Can compare to CWEX data - custom built for measurement of wind wakes using EC.
 
     Blog: https://wiki.ucar.edu/pages/viewrecentblogposts.action?key=cwex11
@@ -541,16 +550,14 @@ def _(cwex, mo, np, plt):
     return
 
 
-app._unparsable_cell(
-    r"""
+@app.cell
+def _(cwex, np):
     cwex.plot_site(
         t_min = np.datetime64('2011-07-02T00:00:00'),
         t_max = np.datetime64('2011-08-17T00:00:00'),
         colour_by = 'co2_4_5m'
-    )/
-    """,
-    name="_"
-)
+    )
+    return
 
 
 @app.cell
@@ -561,7 +568,7 @@ def _(cwex):
 
 @app.cell
 def _(np, plt, wd, ws):
-    _fig, _ax = plt.subplots(figsize=(10, 10), subplot_kw={'projection': 'polar'})
+    _fig, _ax = plt.subplots(figsize=(6, 6), subplot_kw={'projection': 'polar'})
 
     _ax.scatter(
         np.radians(wd), ws, s = 1, alpha = 0.2
@@ -591,18 +598,42 @@ def _(cwex):
 
 
 @app.cell
-def _(Literal):
-    def candidate_wakes(
-            tower: Literal['NCAR1']
-        ):
-        '''
-        Return times in which it is likely that the given tower is in the wake of a wind turbine.
-        Determined by the wind direction being within a given width of the direction from the turbine to the tower.
-        Wind speed threshold may also be applied.
+def _(cwex):
+    wakes = cwex.wake_candidates(
+        'all',
+        # t_min = np.datetime64('2011-07-02T00:00:00'),
+        # t_max = np.datetime64('2011-08-17T00:00:00'),
+    )
+    wakes
+    return (wakes,)
 
 
-        '''
+@app.cell
+def _(cwex, plt, wakes):
+    _fig, _axs = plt.subplots(2, 2, figsize=(12, 12), subplot_kw={'projection': 'polar'})
 
+    [cwex.plot_wake_candidates(_station, wake_candidates = wakes, ax=_axs[i // 2, i % 2]) for i, _station in enumerate(cwex.stations)]
+    _fig
+    return
+
+
+@app.cell
+def _(cwex, wakes):
+    cwex.plot_wake_candidates('NCAR2', wake_candidates = wakes)
+    return
+
+
+@app.cell
+def _(cwex):
+    cwex.plot_wake_geometry(190, 'all', wake_width_deg = 5)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    #### 2.2. Applying this to our candidate towers
+    """)
     return
 
 
