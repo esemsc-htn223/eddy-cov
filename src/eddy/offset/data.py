@@ -1,5 +1,7 @@
 __all__ = ['OFFSET_DIR', 'load_uk']
 
+import json
+
 import geopandas as gpd
 import pandas as pd
 import requests
@@ -22,12 +24,13 @@ def _download_uk() -> None:
 @standardise_df
 def load_uk(*, force_download: bool = False) -> gpd.GeoDataFrame:
     """
-    Load UK woodland carbon code offset projects as a GeoDataFrame. If the data is not found locally, it will be downloaded from the source.
+    Load UK woodland carbon code offset projects as a GeoDataFrame. The projects and their class definitions are
+    downloaded from the source if not found locally.
 
     Parameters
     ----------
     force_download : bool, optional
-        If True, the data will be downloaded from the source even if it exists locally. Default is False.
+        If True, the projects and class definitions are downloaded from the source even if they exist locally. Default is False.
     
     Returns
     -------
@@ -39,7 +42,7 @@ def load_uk(*, force_download: bool = False) -> gpd.GeoDataFrame:
     
     gdf = gpd.read_file(OFFSET_DIR / 'offset_uk.geojson').set_index('OBJECTID')
     class_mapping = {}
-    for item in _load_uk_metadata()['types']:
+    for item in _load_uk_metadata(force_download=force_download)['types']:
         class_mapping[item['id']] = {
             'name': item['name'],
             'subclasses': {_sub['code']: _sub['name'] for _sub in item['domains']['Sub_Class']['codedValues']}
@@ -52,7 +55,6 @@ def load_uk(*, force_download: bool = False) -> gpd.GeoDataFrame:
         ).astype('category')
 
     gdf[['Country', 'Project_status', 'RAG_Status']] = gdf[['Country', 'Project_status', 'RAG_Status']].astype('category')
-    gdf.convert_dtypes()
     gdf[['Class', 'Sub_Class']] = gdf[['Class', 'Sub_Class']].astype('int8')
     gdf['Year_5_Ver_Due_Date'] = pd.to_datetime(gdf['Year_5_Ver_Due_Date'], errors='coerce', format = '%a, %d %b %Y %H:%M:%S GMT')
     gdf['Year_15_Ver_Due_Date'] = pd.to_datetime(gdf['Year_15_Ver_Due_Date'], errors='coerce', format = '%a, %d %b %Y %H:%M:%S GMT')
@@ -66,10 +68,15 @@ def load_uk(*, force_download: bool = False) -> gpd.GeoDataFrame:
     return gdf
 
 
-def _load_uk_metadata():
+def _load_uk_metadata(*, force_download: bool = False) -> dict:
     '''
-    Loads the metadata for UK woodland carbon code offset projects from the API.
+    The metadata (incl. class and subclass definitions) for UK woodland carbon code offset projects,
+    downloaded from the API if not stored locally or if `force_download` is True.
     '''
-    url = 'https://services9.arcgis.com/RCPJF8Z8BrfjscvL/ArcGIS/rest/services/Woodland_Carbon_Code_Projects_Read_Only_View/FeatureServer/0?f=pjson'
-
-    return requests.get(url).json()
+    path = OFFSET_DIR / 'offset_uk_metadata.json'
+    if force_download or not path.exists():
+        url = 'https://services9.arcgis.com/RCPJF8Z8BrfjscvL/ArcGIS/rest/services/Woodland_Carbon_Code_Projects_Read_Only_View/FeatureServer/0?f=pjson'
+        response = requests.get(url)
+        response.raise_for_status()
+        path.write_text(response.text)
+    return json.loads(path.read_text())
