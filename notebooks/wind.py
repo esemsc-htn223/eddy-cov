@@ -61,9 +61,9 @@ def _():
     import eddy
 
     # get dirs too
-    from eddy.data.flux import FLUX_DIR, FLUXNET_DIR, TERN_DIR, AMERIFLUX_DIR
+    from eddy.flux.data import FLUX_DIR, FLUXNET_DIR, TERN_DIR, AMERIFLUX_DIR
     from eddy.util import DATA_DIR, OUT_DIR
-    from eddy.data import _standardise_df as standardise_df
+    from eddy.util import _standardise_df as standardise_df
 
 
     return (eddy,)
@@ -80,8 +80,8 @@ def _(mo):
 @app.cell
 def _(eddy):
     # geographic data
-    GDF_COUNTRIES = eddy.data.load_natural_earth_countries()
-    GDF_STATES = eddy.data.load_natural_earth_states()
+    GDF_COUNTRIES = eddy.geo.data.load_natural_earth_countries()
+    GDF_STATES = eddy.geo.data.load_natural_earth_states()
 
     #_uk_bbox = (-7.57216793459, 49.959999905, 1.68153079591, 58.6350001085)
     UK_BBOX = {
@@ -96,14 +96,14 @@ def _(eddy):
 @app.cell
 async def _(eddy):
     # flux tower locations
-    gdf_fluxnet = await eddy.data.flux.load_fluxnet_snapshot()
+    gdf_fluxnet = await eddy.flux.data.load_fluxnet_snapshot()
     return (gdf_fluxnet,)
 
 
 @app.cell
 def _(GDF_COUNTRIES, eddy, mo):
     # wind turbine locations
-    gdf_wind = eddy.data.turbines.load_wind_farm_locs()
+    gdf_wind = eddy.turbines.data.load_locs()
 
     ax = gdf_wind.to_crs(eddy.PLOTTING_CRS).plot(column = 'capacity_mw', figsize = (10,20), legend = False, markersize = 0.1, alpha = 0.1)
     GDF_COUNTRIES.to_crs(eddy.PLOTTING_CRS).plot(ax=ax, facecolor = 'None', linewidth = 0.25)
@@ -162,13 +162,13 @@ def _(GDF_COUNTRIES, eddy, gdf_fluxnet, gdf_wind, mo, plt):
     match_dist = 35_000  # m
     min_years = 2
 
-    gdf_matches = eddy.turbines.wind_farm_ec_neighbours(
+    gdf_matches = eddy.turbines.ec_neighbours(
         gdf_wind, gdf_fluxnet, 
         max_match_dist = match_dist,  # m
         overlap = min_years  # 2 years minimum 
     )
 
-    _ax = eddy.turbines.plot_wind_farm_ec_neighbours(
+    _ax = eddy.turbines.plot.plot_ec_neighbours(
         gdf_matches,
         pad = 500000,
         gdf_borders = GDF_COUNTRIES,
@@ -224,17 +224,32 @@ def _(gdf_matches):
 
 
 @app.cell
-def _(gdf_wind):
-    gdf_wind.groupby('gem_location_id').agg(
-        n_phases = ('project', 'count'),
-        n_retired_years = ('retired_year', 'nunique')
-    ).sort_values('n_retired_years', ascending=False)
+def _(GDF_COUNTRIES, eddy, gdf_matches, mo):
+
+    _df = gdf_matches.loc[gdf_matches['site_id'].str.startswith('UK')].sort_values('dist_m')
+    mo.vstack([
+        eddy.turbines.plot.plot_ec_neighbours(
+            _df,
+            pad = 500000,
+            gdf_borders = GDF_COUNTRIES,
+            scale_bar = False,
+            figsize = (15, 7)
+        ),
+        _df,
+        _df.groupby('site_id').agg(
+            n_wind_matches = ('wind_project', 'count'),
+            n_below_5km = ('dist_m', lambda x: (x < 5000).sum()),
+            min_dist_m = ('dist_m', 'min'),
+            max_dist_m = ('dist_m', 'max')
+        )
+    ])
+
     return
 
 
 @app.cell
 def _(GDF_COUNTRIES, eddy, gdf_matches):
-    _ax = eddy.turbines.plot_wind_farm_ec_neighbours(
+    _ax = eddy.turbines.plot.plot_ec_neighbours(
         gdf_matches.loc[gdf_matches['site_id'] == 'DE-RuC'],
         pad = 750000,
         gdf_borders = GDF_COUNTRIES,
@@ -247,29 +262,21 @@ def _(GDF_COUNTRIES, eddy, gdf_matches):
 
 
 @app.cell
-async def _(eddy, gdf_matches):
-    site_files = await eddy.data.flux.get_fluxnet_site_dirs(
-        gdf_matches['site_id'].unique().tolist(), 
-    )
+async def _(eddy):
+    # site_files = await eddy.flux.data.get_fluxnet_site_dirs(
+    #     gdf_matches['site_id'].unique().tolist(), 
+    # )
+
+    site_files = await eddy.flux.data.get_fluxnet_site_dirs(['DE-RuC', 'UK-Gnn'])
 
     fs_de_ruc = site_files['DE-RuC']
-    fs_de_hai = site_files['DE-Hai']
-    fs_de_hdn = site_files['DE-Hdn']
-    fs_de_rum = site_files['DE-RuM']
-
-    fs_us_myb = site_files['US-Myb']
-    fs_us_wjs = site_files['US-Wjs']
-    return
+    fs_uk_gnn = site_files['UK-Gnn']
+    return (fs_de_ruc,)
 
 
 @app.cell
-def _():
-    return
-
-
-@app.cell
-def _():
-    # fs_de_ruc.fluxmet()
+def _(fs_de_ruc):
+    fs_de_ruc.fluxmet()
     return
 
 
@@ -318,7 +325,7 @@ def _(mo):
 
 @app.cell
 def _(GDF_COUNTRIES, UK_BBOX, eddy, gdf_wind, plt):
-    gdf_offset_uk = eddy.data.offset.load_offset_uk()
+    gdf_offset_uk = eddy.offset.data.load_uk()
 
     _fig, _ax = plt.subplots(figsize=(10, 10))
     gdf_offset_uk.to_crs(eddy.PLOTTING_CRS).plot(facecolor='green', ax = _ax)
@@ -334,14 +341,14 @@ def _(GDF_COUNTRIES, UK_BBOX, eddy, gdf_wind, plt):
 
 @app.cell
 def _(eddy, gdf_offset_uk, gdf_wind):
-    gdf_wo_matches = eddy.offset.wind_farm_offset_neighbours(gdf_wind, gdf_offset_uk, max_match_dist = 10_000).sort_values('dist_m')
+    gdf_wo_matches = eddy.turbines.offset_neighbours(gdf_wind, gdf_offset_uk, max_match_dist = 10_000).sort_values('dist_m')
     gdf_wo_matches
     return (gdf_wo_matches,)
 
 
 @app.cell
 def _(eddy, gdf_wo_matches):
-    m_wo = eddy.offset.explore_wind_farm_offset_neighbours(
+    m_wo = eddy.turbines.plot.explore_offset_neighbours(
         gdf_wo_matches, gdf_base = None, simplify_m = 25,
         colour_wind = 'lightblue'
     )
@@ -383,11 +390,11 @@ def _(gdf_offset_uk):
 @app.cell
 def _(gdf_wo_matches):
     WAKE_DIST_M = 5_000  # distance a wind turbine wake can extend downwind, in metres
-    df_offset_within_wake = gdf_wo_matches.loc[gdf_wo_matches['dist_m'] <= WAKE_DIST_M].groupby('project_name').agg(
-        area_ha = ('area_ha', 'sum'),
-        offset_classes = ('class', lambda _s: ', '.join(sorted(_s.unique()))),
-        offset_subclasses = ('subclass', lambda _s: ', '.join(sorted(_s.unique()))),
-        n_wind_farms = ('Project Name', 'count'),
+    df_offset_within_wake = gdf_wo_matches.loc[gdf_wo_matches['dist_m'] <= WAKE_DIST_M].groupby('offset_project_name').agg(
+        area_ha = ('offset_area_ha', 'sum'),
+        offset_classes = ('offset_class', lambda _s: ', '.join(sorted(_s.unique()))),
+        offset_subclasses = ('offset_subclass', lambda _s: ', '.join(sorted(_s.unique()))),
+        n_wind_farms = ('wind_project_name', 'count'),
         min_farm_dist_km = ('dist_m', lambda _s: round(_s.min() / 1000, 2)),
         mean_farm_dist_km = ('dist_m', lambda _s: round(_s.mean() / 1000, 2)),
         max_farm_dist_km = ('dist_m', lambda _s: round(_s.max() / 1000, 2)),
@@ -506,7 +513,7 @@ def _(mo):
 
 @app.cell
 def _():
-    from eddy.data.cwex import CWEX
+    from eddy.flux.cwex import CWEX
 
     cwex = CWEX()
     return (cwex,)
@@ -534,14 +541,16 @@ def _(cwex, mo, np, plt):
     return
 
 
-@app.cell
-def _(cwex, np):
+app._unparsable_cell(
+    r"""
     cwex.plot_site(
         t_min = np.datetime64('2011-07-02T00:00:00'),
         t_max = np.datetime64('2011-08-17T00:00:00'),
         colour_by = 'co2_4_5m'
-    )
-    return
+    )/
+    """,
+    name="_"
+)
 
 
 @app.cell
@@ -612,6 +621,16 @@ def _(mo):
         1. At their own location
         2. At a nearby location
     2. Can EC towers be used to regionally downscale climate data, such as ERA5?
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    Anisotropy-based MOST can help!
+    - [Paper](https://arxiv.org/abs/2502.13970v2)
+    - [Data](https://data.neonscience.org/data-products/DP4.00200.001)
     """)
     return
 

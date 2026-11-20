@@ -1,9 +1,10 @@
+__all__ = ['WIND_DIR', 'load_locs']
+
 from typing import Literal
 import pandas as pd
 import geopandas as gpd
 
-from eddy.util import DATA_DIR
-from eddy.data.common import standardise_df
+from eddy.util import DATA_DIR, standardise_df
 
 WIND_DIR = DATA_DIR / 'wind'
 
@@ -15,7 +16,7 @@ def _download_wind_data() -> None:
     raise NotImplementedError("Wind data download function not implemented yet. Please download the data manually from https://globalenergymonitor.org/projects/global-wind-power-tracker/ and place it in the 'wind' directory.")
 
 @standardise_df
-def load_wind_farm_locs(source: Literal['gem'] = 'gem') -> gpd.GeoDataFrame:
+def load_locs(source: Literal['gem'] = 'gem') -> gpd.GeoDataFrame:
     '''
     Load wind farm locations from the Global Wind Power Tracker Excel file and return it as a GeoDataFrame.
 

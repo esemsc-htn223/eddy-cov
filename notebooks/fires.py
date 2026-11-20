@@ -58,8 +58,8 @@ def _(mo):
 @app.cell
 async def _(eddy):
     # geographic data
-    GDF_COUNTRIES = eddy.load_natural_earth_countries()
-    GDF_STATES = eddy.load_natural_earth_states()
+    GDF_COUNTRIES = eddy.geo.data.load_natural_earth_countries()
+    GDF_STATES = eddy.geo.data.load_natural_earth_states()
 
     #_uk_bbox = (-7.57216793459, 49.959999905, 1.68153079591, 58.6350001085)
     UK_BBOX = {
@@ -68,7 +68,7 @@ async def _(eddy):
         'min_lat': 49.0,
         'max_lat': 61.0
     }
-    gdf_fluxnet = await eddy.data.load_fluxnet_snapshot()
+    gdf_fluxnet = await eddy.flux.data.load_fluxnet_snapshot()
     return GDF_COUNTRIES, UK_BBOX, gdf_fluxnet
 
 

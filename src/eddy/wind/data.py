@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from eddy.util import DATA_DIR, logger_data
-from eddy.data.common import average_over_time
+from eddy.util import average_over_time
 
 REANALYSIS_DIR = DATA_DIR / 'reanalysis'
 if not REANALYSIS_DIR.exists():

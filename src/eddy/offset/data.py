@@ -1,16 +1,17 @@
+__all__ = ['OFFSET_DIR', 'load_uk']
+
 import geopandas as gpd
 import pandas as pd
 import requests
 
-from eddy.util import DATA_DIR
-from eddy.data.common import standardise_df
+from eddy.util import DATA_DIR, standardise_df
 
 OFFSET_DIR = DATA_DIR / 'offset'
 if not OFFSET_DIR.exists():
     OFFSET_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _download_offset_uk() -> None:
+def _download_uk() -> None:
     """
     Download UK woodland carbon code offset projects as a GeoJSON file and save it to the local directory.
     """
@@ -19,7 +20,7 @@ def _download_offset_uk() -> None:
     gdf.to_file(OFFSET_DIR / 'offset_uk.geojson', driver='GeoJSON')
 
 @standardise_df
-def load_offset_uk(*, force_download: bool = False) -> gpd.GeoDataFrame:
+def load_uk(*, force_download: bool = False) -> gpd.GeoDataFrame:
     """
     Load UK woodland carbon code offset projects as a GeoDataFrame. If the data is not found locally, it will be downloaded from the source.
 
@@ -34,11 +35,11 @@ def load_offset_uk(*, force_download: bool = False) -> gpd.GeoDataFrame:
         A GeoDataFrame containing the UK woodland carbon code offset projects.
     """
     if force_download or not (OFFSET_DIR / 'offset_uk.geojson').exists():
-        _download_offset_uk()
+        _download_uk()
     
     gdf = gpd.read_file(OFFSET_DIR / 'offset_uk.geojson').set_index('OBJECTID')
     class_mapping = {}
-    for item in _load_offset_uk_metadata()['types']:
+    for item in _load_uk_metadata()['types']:
         class_mapping[item['id']] = {
             'name': item['name'],
             'subclasses': {_sub['code']: _sub['name'] for _sub in item['domains']['Sub_Class']['codedValues']}
@@ -65,7 +66,7 @@ def load_offset_uk(*, force_download: bool = False) -> gpd.GeoDataFrame:
     return gdf
 
 
-def _load_offset_uk_metadata():
+def _load_uk_metadata():
     '''
     Loads the metadata for UK woodland carbon code offset projects from the API.
     '''

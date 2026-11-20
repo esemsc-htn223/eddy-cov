@@ -1,6 +1,6 @@
 __all__ = [
     'FLUX_DIR', 'FLUXNET_DIR', 'TERN_DIR', 'AMERIFLUX_DIR',
-    'load_fluxnet_snapshot', 'load_fluxnet_sites'
+    'latest_fluxnet_snapshot_path', 'load_fluxnet_snapshot', 'get_fluxnet_site_dirs', 'FLUXNETSite'
 ]
 
 import fluxnet_shuttle as shuttle
@@ -15,7 +15,7 @@ import os
 import datetime
 
 from eddy.util import DATA_DIR, logger_data
-from eddy.data.common import standardise_df, _standardise_df
+from eddy.util import standardise_df, _standardise_df
 
 FLUX_DIR = DATA_DIR / 'flux'
 FLUXNET_DIR = FLUX_DIR / 'FLUXNET'

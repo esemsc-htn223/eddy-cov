@@ -67,7 +67,9 @@ def _(mo):
 
 @app.cell
 def _(mo):
-    from eddy.data import GDF_COUNTRIES, GDF_STATES
+    from eddy.geo.data import load_natural_earth_countries as _load_countries, load_natural_earth_states as _load_states
+    GDF_COUNTRIES = _load_countries()
+    GDF_STATES = _load_states()
     _ax_coast = GDF_COUNTRIES.plot(linewidth = 0.25, facecolor = 'None', edgecolor = 'k')
     _ax_coast.set_axis_off()
     _ax_coast.set_title('GDF_COUNTRIES: Country Borders')
@@ -105,8 +107,8 @@ def _(mo):
 
 @app.cell
 async def _(eddy):
-    gdf_fluxnet = await eddy.data.load_fluxnet_snapshot()
-    gdf_fluxnet_path = await eddy.data.load_fluxnet_snapshot(return_type = 'path')
+    gdf_fluxnet = await eddy.flux.data.load_fluxnet_snapshot()
+    gdf_fluxnet_path = await eddy.flux.data.load_fluxnet_snapshot(return_type = 'path')
     gdf_fluxnet
     return gdf_fluxnet, gdf_fluxnet_path
 

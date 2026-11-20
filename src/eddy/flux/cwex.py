@@ -14,12 +14,12 @@ import pathlib
 import warnings
 from typing import Literal, Iterator
 
-from eddy.util import DATA_DIR
-from eddy.wind import WindProfile, get_profile, CovarianceAccumulator
-from eddy.data.common import smallest_file, var_metadata, average_over_time, standardise_df
-from eddy.data.reanalysis import get_dataset
+from eddy.util import smallest_file, var_metadata, average_over_time, standardise_df
+from eddy.wind import WindProfile, get_profile
+from eddy.wind.data import get_dataset
+from eddy.flux._flux import CovarianceAccumulator
+from eddy.flux.data import FLUX_DIR
 
-FLUX_DIR = DATA_DIR / 'flux'
 NCAR_DIR = FLUX_DIR / 'NCAR'
 CWEX_DIR = NCAR_DIR / 'CWEX'
 
@@ -778,7 +778,7 @@ class CWEX:
         Returns
         -------
         dict of str: np.ndarray, or (np.ndarray, dict)
-            The output of `eddy.wind.CovarianceAccumulator.fluxes`, on the dense bin grid.
+            The output of `eddy.flux.CovarianceAccumulator.fluxes`, on the dense bin grid.
             If `return_time` is True, returns a tuple of (bin start times, fluxes).
         '''
         if time_averaging is None:
@@ -1047,7 +1047,7 @@ class CWEX:
             How to weight measurements from each tower. Defaults to 'upwind'. See `_tower_weights`.
         dataset : str, optional
             Which reanalysis product to use when `source='reanalysis'`. See
-            `eddy.data.reanalysis.get_dataset`. Defaults to 'wtk' (the NREL WIND Toolkit), which
+            `eddy.wind.data.get_dataset`. Defaults to 'wtk' (the NREL WIND Toolkit), which
             covers North America only.
         return_quality : bool, optional
             If True, also return a dict of per-period diagnostics. Defaults to False.

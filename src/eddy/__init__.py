@@ -1,10 +1,9 @@
-from eddy import flux, turbines, wind, offset, data
+from eddy import util, geo, flux, wind, turbines, offset
 from eddy.util import DATA_DIR, OUT_DIR, BASE_CRS, PLOTTING_CRS, DISTANCE_CRS
 
 
 __all__ = [
-    'flux', 'turbines', 'wind', 'offset', 
-    'data', 
+    'util', 'geo', 'flux', 'wind', 'turbines', 'offset',
     'BASE_CRS', 'PLOTTING_CRS', 'DISTANCE_CRS',
     'DATA_DIR', 'OUT_DIR'
 ]
