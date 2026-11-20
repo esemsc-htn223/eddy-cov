@@ -1,4 +1,4 @@
-__all__ = ['WIND_DIR', 'load_locs']
+__all__ = ['TURBINES_DIR', 'load_locs']
 
 from typing import Literal
 import pandas as pd
@@ -6,7 +6,7 @@ import geopandas as gpd
 
 from eddy.util import DATA_DIR, standardise_df
 
-WIND_DIR = DATA_DIR / 'wind'
+TURBINES_DIR = DATA_DIR / 'turbines'
 
 
 def _download_wind_data() -> None:
@@ -34,7 +34,7 @@ def load_locs(source: Literal['gem'] = 'gem') -> gpd.GeoDataFrame:
     gpd.GeoDataFrame
     '''
     if source.lower() == 'gem':
-        df_wind = pd.read_excel(WIND_DIR / 'Global-Wind-Power-Tracker-February-2026.xlsx', sheet_name = 'Data')
+        df_wind = pd.read_excel(TURBINES_DIR / 'Global-Wind-Power-Tracker-February-2026.xlsx', sheet_name = 'Data')
         gdf_wind = gpd.GeoDataFrame(df_wind, geometry=gpd.points_from_xy(df_wind['Longitude'], df_wind['Latitude'], crs='EPSG:4326'))
         gdf_wind['project'] = gdf_wind['Project Name'].astype(str) + ', phase ' + gdf_wind['Phase Name'].astype(str)
         gdf_wind.rename(columns = {'GEM phase ID': 'gem_phase_id'}, inplace = True)
