@@ -695,6 +695,10 @@ class CWEX:
         time, u = self.timeseries(u_var, return_time=True, **read)
         v = self.timeseries(v_var, **read)
 
+        if not u.size:
+            empty = np.array([], dtype=np.float64)
+            return (np.array([], dtype='datetime64[ns]'), empty, empty) if return_time else (empty, empty)
+
         # 4.5 m anemometers have a sample axis, but 10 m vanes do not. Selecting a single station
         # drops an axis, so find the sample axis by name rather than by counting dimensions.
         sample_axis = self._sample_axis(u_var, sample='all', station=station)
@@ -1025,7 +1029,7 @@ class CWEX:
             'A1' to 'A5', are ~780 m or more from the nearest tower so quality will be poor.
         source : {'ec-weather-vane', 'ec-sonic-anemometer', 'reanalysis', 'data-assimilation'}
             The source of the wind speed data. Does not affect sources for EC calculations, which
-            always use the high frequency 'ec-sonic-anemometer'. Defaults to 'reanalysis'.
+            always use the high frequency 'ec-sonic-anemometer'. Required.
             Note 'data-assimilation' is not yet implemented.
         t_min : np.datetime64 or None, optional
             The minimum time to consider. Defaults to None.
@@ -1299,7 +1303,7 @@ class CWEX:
             nearest it when `time_averaging` is None.
         t_min, t_max : np.datetime64 or None, optional
             An explicit window. Cannot be combined with `time`; a missing bound falls back to the
-            start or end of the campaign.
+            start or end of the experiment.
         time_averaging : str or np.timedelta64 or None, optional
             The averaging period, used to size the bin around `time`.
 
@@ -1567,7 +1571,7 @@ class CWEX:
 
         if direction.size == 0:
             ax.set_title(f'{label} — no data', pad=15)
-            return ax.figure if return_fig else ax
+            return (ax.figure, ax) if return_fig else ax
 
         sector_width = 360 / n_sectors
         dir_edges = np.linspace(-sector_width / 2, 360 - sector_width / 2, n_sectors + 1)
@@ -1805,7 +1809,7 @@ class CWEX:
 
         if direction.size:
             direction, speed = self._vector_mean(direction, speed, axis=0)
-        else:  # the window falls outside the campaign's coverage
+        else:  # the window falls outside the experiment's coverage
             direction = speed = np.full(self.n_stations, np.nan)
 
         has_wind = np.isfinite(direction) & np.isfinite(speed)
