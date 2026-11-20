@@ -52,9 +52,14 @@ def _pairs_within(gdf_left: gpd.GeoDataFrame, gdf_right: gpd.GeoDataFrame, max_d
     return pairs.groupby(['left_pos', 'right_pos'], as_index=False)['dist_m'].min()
 
 
-def _prefixed(gdf: gpd.GeoDataFrame, positions: np.ndarray, prefix: str) -> tuple[pd.DataFrame, str]:
-    '''Rows of `gdf` at `positions`, with the index as an id column and every other column prefixed.'''
-    id_col = gdf.index.name or f'{prefix}_id'
+def _prefixed(
+        gdf: gpd.GeoDataFrame, positions: np.ndarray, prefix: str, *, taken: str|None = None
+    ) -> tuple[pd.DataFrame, str]:
+    '''
+    Rows of `gdf` at `positions`, with the index as an id column and every other column prefixed.
+    The id column is named after the index, or '<prefix>_id' if the index is unnamed or its name is `taken`.
+    '''
+    id_col = gdf.index.name if gdf.index.name not in (None, taken) else f'{prefix}_id'
     df = gdf.iloc[positions].rename_axis(id_col).reset_index()
     df = df.rename(columns={col: f'{prefix}_{col}' for col in df.columns if col != id_col})
     return df, id_col
@@ -94,7 +99,8 @@ def neighbours(
     -------
     geopandas.GeoDataFrame
         One row per (left, right) pair, indexed by 'match_id' ('<left id>_<right id>') and sorted by 'dist_m'.
-        Columns: the left and right ids (named after each input's index), 'dist_m', 'n_<right_prefix>_within'
+        Columns: the left and right ids (named after each input's index, or '<prefix>_id' if unnamed or the
+        same on both sides), 'dist_m', 'n_<right_prefix>_within'
         (right matches per left row), 'n_<left_prefix>_within' (left matches per right row), then every input
         column prefixed with its side's prefix. '<left_prefix>_geometry' is the active geometry, and
         '<right_prefix>_geometry' holds the right geometry.
@@ -110,7 +116,7 @@ def neighbours(
     pairs = _pairs_within(gdf_left, gdf_right, max_dist_m)
 
     df_left, left_id = _prefixed(gdf_left, pairs['left_pos'].to_numpy(), left_prefix)
-    df_right, right_id = _prefixed(gdf_right, pairs['right_pos'].to_numpy(), right_prefix)
+    df_right, right_id = _prefixed(gdf_right, pairs['right_pos'].to_numpy(), right_prefix, taken=left_id)
     ids = pd.DataFrame({left_id: df_left.pop(left_id), right_id: df_right.pop(right_id)})
     ids['dist_m'] = pairs['dist_m'].to_numpy()
     ids[f'n_{right_prefix}_within'] = ids.groupby(left_id)['dist_m'].transform('size')
