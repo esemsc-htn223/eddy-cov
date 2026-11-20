@@ -76,8 +76,13 @@ class CovarianceAccumulator:
             'vv': v * v, 'vw': v * w, 'ww': w * w,
             'ut': u * t, 'vt': v * t, 'wt': w * t,
         }
+        n_trailing = int(np.prod(self.shape[1:]))
+        flat_index = (np.asarray(bin_index).reshape(-1, 1) * n_trailing + np.arange(n_trailing)).ravel()
+        term_shape = np.shape(bin_index) + self.shape[1:]
         for key, term in terms.items():
-            np.add.at(self.sums[key], bin_index, term)
+            self.sums[key] += np.bincount(
+                flat_index, weights=np.broadcast_to(term, term_shape).ravel(), minlength=self.sums[key].size
+            ).reshape(self.shape)
 
         return self
 
