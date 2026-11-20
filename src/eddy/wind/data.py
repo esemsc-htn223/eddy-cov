@@ -109,14 +109,12 @@ class Coverage:
         bool
         '''
 
-        in_space = True  # default to True if no lat/lon is provided - answer depends only on time
-        if lat is not None and lon is not None:
-            in_space = self.covers_space(lat, lon)
-        else:
-            if t_min is None and t_max is None:
-                raise ValueError("Provide one or all of a t_min, t_max, or a lat/lon pair to check coverage.")
-
-        in_time = self.covers_time(t_min=t_min, t_max=t_max)
+        has_site = lat is not None and lon is not None
+        has_window = t_min is not None or t_max is not None
+        if not has_site and not has_window:
+            raise ValueError("Provide one or all of a t_min, t_max, or a lat/lon pair to check coverage.")
+        in_space = self.covers_space(lat, lon) if has_site else True
+        in_time = self.covers_time(t_min=t_min, t_max=t_max) if has_window else True
         return in_space and in_time
 
     def describe(self) -> str:
@@ -199,7 +197,8 @@ class Reanalysis:
             If the site or window is outside the domain and `raise_on_fail` is True.
         '''
         in_space = self.coverage.covers_space(lat=lat, lon=lon)
-        in_time = self.coverage.covers_time(t_min=t_min, t_max=t_max)
+        in_time = (self.coverage.covers_time(t_min=t_min, t_max=t_max)
+                   if t_min is not None or t_max is not None else True)
         if in_time and in_space:
             return True
 
@@ -436,8 +435,8 @@ class ERA5(Reanalysis):
             Height above ground in metres. Defaults to 80. 
             Interpolated logarithmically between 10 m and 100 m. 
             Heights above 100 m are held at 100 m, and same for heights below 10 m.
-        t_min, t_max : np.datetime64 or None, optional
-            The window, also used to find the data file.
+        t_min, t_max : np.datetime64
+            The window, also used to find the data file. Both are required.
         time_averaging : str or np.timedelta64 or None, optional
             Bin length for the output. ERA5 is hourly, so bins shorter than an hour are
             interpolated rather than averaged. Defaults to '30m'.
@@ -451,6 +450,8 @@ class ERA5(Reanalysis):
         tuple of np.ndarray
             (direction, speed), preceded by the timestamps if `return_time` is True.
         '''
+        if t_min is None or t_max is None:
+            raise ValueError("ERA5.wind needs both t_min and t_max, which identify the downloaded data file.")
         self.check_site(lat, lon, t_min=t_min, t_max=t_max)
 
         path = self._data_path(lat, lon, t_min, t_max)
@@ -1081,9 +1082,9 @@ def datasets_for_site(
     Note that the WIND Toolkit test here is the declared bounding box only, which is only
     an approximate rectangle covering the actual model domain. A site may be inside the 
     bounding box but outside the domain, and some bounding boxes overlap causing a site to be
-    inside multiple boxes at once. Use `WindToolkit.grid_index` to get an authoritative answer
-    by measuring the distance to the nearest grid point (though note this requires network access
-    credentials).
+    inside multiple boxes at once. Use `WindToolkit.site_metadata` to get an authoritative answer
+    by measuring the distance to the nearest grid point (though note this needs the site's data
+    downloaded first, which requires credentials).
 
     Parameters
     ----------
