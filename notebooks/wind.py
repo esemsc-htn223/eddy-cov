@@ -63,7 +63,7 @@ def _():
     # get dirs too
     from eddy.flux.data import FLUX_DIR, FLUXNET_DIR, TERN_DIR, AMERIFLUX_DIR
     from eddy.util import DATA_DIR, OUT_DIR
-    from eddy.util import _standardise_df as standardise_df
+    from eddy.util import standardise_df
 
 
     return (eddy,)

@@ -4,7 +4,7 @@ __all__ = [
     'logger_data', 'logger_processing',
     'BASEMAP_DEFAULT',
     'VON_KARMAN', 'GRAVITY',
-    'standardise_df', '_standardise_df',
+    'standardise_df',
     'smallest_file',
     'var_metadata', 'var_dim_size', 'var_n_stations', 'var_n_samples',
     'average_over_time'
@@ -13,6 +13,8 @@ __all__ = [
 import os
 import pathlib
 import logging
+import inspect
+import functools
 import numpy as np
 import pandas as pd
 import geopandas as gpd
@@ -67,44 +69,53 @@ BASEMAP_DEFAULT = xyz.CartoDB.Positron(api_key=os.getenv('CARTO_API_KEY', None))
 
 
 # Helpers
-def standardise_df(func) -> pd.DataFrame:
-    """
-    Decorator that standardises column names of an output DataFrame to snake_case. Does nothing if the output is not a DataFrame.
-    """
-    def inner(*args, **kwargs):
-        df = func(*args, **kwargs)
-        if not isinstance(df, pd.DataFrame):
-            if isinstance(df, [list, tuple, set]):
-                out = []
-                for i, item in enumerate(df):
-                    if isinstance(item, pd.DataFrame):
-                        out.append(_standardise_df(item))
-                    else:
-                        out.append(item)
-                return type(df)(out)
-            return df
-        return _standardise_df(df)
-    return inner
-
-def _standardise_df(df: pd.DataFrame) -> pd.DataFrame:
+def standardise_df(obj):
     '''
-    Standardise a DataFrame:
-    1. Convert column names to snake_case.
-    2. Set GeoDataFrame geometry and CRS if applicable.
+    Standardise a DataFrame, or decorate a function to standardise returned DataFrames.
 
-    In general, use of this function is discouraged in favour of the `@standardise_df` decorator, 
-    which automatically applies this function to the output of a DataFrame-returning function.
+    Standardising converts dtypes and column names to snake_case, and for a GeoDataFrame sets
+    'geometry' as the active geometry and reprojects to `BASE_CRS`.
 
     Parameters
     ----------
-    df : pd.DataFrame
-        The DataFrame to standardise.
+    obj : pd.DataFrame or callable
+        A DataFrame, to get back a standardised copy: `standardise_df(df)`.
+        Or a function (sync or async), to use as a decorator: `@standardise_df`. DataFrames it returns,
+        alone or inside a tuple, list or dict, are standardised; anything else is returned unchanged.
 
     Returns
     -------
-    pd.DataFrame
-        A copy of the input DataFrame, with the above standardisations applied.
+    pd.DataFrame or callable
     '''
+    if isinstance(obj, pd.DataFrame):
+        return _standardise_df(obj)
+    if not callable(obj):
+        raise TypeError(f'standardise_df expects a DataFrame or a function, got {type(obj).__name__}.')
+
+    if inspect.iscoroutinefunction(obj):
+        @functools.wraps(obj)
+        async def inner(*args, **kwargs):
+            return _standardise_output(await obj(*args, **kwargs))
+    else:
+        @functools.wraps(obj)
+        def inner(*args, **kwargs):
+            return _standardise_output(obj(*args, **kwargs))
+    return inner
+
+
+def _standardise_output(out):
+    '''Standardise `out` if it is a DataFrame, or the DataFrames inside it if it is a tuple, list or dict.'''
+    if isinstance(out, pd.DataFrame):
+        return _standardise_df(out)
+    if type(out) in (tuple, list):
+        return type(out)(_standardise_output(item) for item in out)
+    if type(out) is dict:
+        return {key: _standardise_output(value) for key, value in out.items()}
+    return out
+
+
+def _standardise_df(df: pd.DataFrame) -> pd.DataFrame:
+    '''A standardised copy of `df`. See `standardise_df`.'''
     df = df.convert_dtypes().copy()
     cols = df.columns
     # account for camelCase
