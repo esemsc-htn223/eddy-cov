@@ -536,9 +536,9 @@ def _(cwex, mo, np, plt):
     _tmax = np.datetime64('2011-08-17T00:00:00')
 
     _ax1 = cwex.plot_windrose(
-        1, samples = 'all',
+        1, #samples = 'all',
         instrument = 'vane',
-        t_min=_tmin, t_max=_tmax,
+        time_averaging = '15m'
     )
 
     _im = imread(cwex.dir_path / 'cwex_ncar1_windrose.png')

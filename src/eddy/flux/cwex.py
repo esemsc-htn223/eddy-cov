@@ -1804,7 +1804,8 @@ class CWEX:
         counts, _, _ = np.histogram2d(direction, speed, bins=[dir_edges, speed_bins])
         freq = 100 * counts / direction.size  # % of valid records
 
-        bottom = np.zeros(n_sectors) + 0.25  # small hole in the middle, so the bars read clearly
+        ax.set_rorigin(-0.25)  # small hole in the middle, so the bars read clearly
+        bottom = np.zeros(n_sectors)
         for j, colour in enumerate(speed_cmap.colors):
             ax.bar(
                 dir_centres, freq[:, j],
