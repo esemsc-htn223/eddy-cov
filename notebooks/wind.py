@@ -609,23 +609,23 @@ def _(cwex):
 
 
 @app.cell
-def _(cwex, plt, wakes):
-    _fig, _axs = plt.subplots(2, 2, figsize=(12, 12), subplot_kw={'projection': 'polar'})
+def _(cwex, mo, plt, wakes):
+    _fig, _axs = plt.subplots(4, 1, figsize=(5, 16), subplot_kw={'projection': 'polar'})
 
-    [cwex.plot_wake_candidates(_station, wake_candidates = wakes, ax=_axs[i // 2, i % 2]) for i, _station in enumerate(cwex.stations)]
-    _fig
+    [cwex.plot_wake_candidates(len(cwex.stations) - _i, wake_candidates = wakes, ax=_axs[_i]) for _i in range(len(cwex.stations))]
+    _fig.tight_layout()
+
+    _axs_geom = cwex.plot_wake_geometry(190, 'all', wake_candidates=wakes)
+
+    mo.hstack([
+        _axs_geom,
+        _fig
+    ], align = 'center', justify = 'space-around')
     return
 
 
 @app.cell
-def _(cwex, wakes):
-    cwex.plot_wake_candidates('NCAR2', wake_candidates = wakes)
-    return
-
-
-@app.cell
-def _(cwex):
-    cwex.plot_wake_geometry(190, 'all', wake_width_deg = 5)
+def _():
     return
 
 
