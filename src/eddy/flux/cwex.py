@@ -2272,6 +2272,7 @@ class CWEX:
             direction: float,
             turbine: str|list[str] = 'B2',
             *,
+            wake_candidates: WakeCandidates|None = None,
             wake_width_deg: float = 5.0,
             wake_model: Literal['frustum', 'wedge'] = 'frustum',
             max_distance_m: float|None = None,
@@ -2304,12 +2305,15 @@ class CWEX:
             Meteorological wind direction (the direction the wind blows from) in degrees.
         turbine : str or list of str, optional
             A turbine id, a list of ids, or 'all'. Defaults to 'B2'.
+        wake_candidates : WakeCandidates or None, optional
+            The candidates to take settings from. If provided, wake_width_deg, wake_model and max_distance_m are ignored
+            and taken from `wake_candidates.criteria`. Otherwise, those parameters are used.
         wake_width_deg : float, optional
-            The full angle at which each wake spreads, in degrees. Defaults to 5.0.
+            The full angle at which each wake spreads, in degrees. Defaults to 5.0. Ignored if `wake_candidates` is given.
         wake_model : {'frustum', 'wedge'}, optional
-            The wake shape, as in `wake_candidates`. Defaults to 'frustum'.
+            The wake shape, as in `wake_candidates`. Defaults to 'frustum'. Ignored if `wake_candidates` is given.
         max_distance_m : float or None, optional
-            If given, towers farther than this from a turbine are not counted as in its wake.
+            If given, towers farther than this from a turbine are not counted as in its wake. Ignored if `wake_candidates` is given.
         rotor : bool, optional
             If True (default), draw each turbine's rotor diameter across the wind, for comparison
             with the wedge width.
@@ -2343,6 +2347,11 @@ class CWEX:
         '''
         turbines = self._resolve_turbines(turbine)
         rotor_diameter_m = self._wake_rotor_diameter(wake_model)
+        if wake_candidates is not None:
+            wake_width_deg = wake_candidates.criteria.get('wake_width_deg', wake_width_deg)
+            wake_model = wake_candidates.criteria.get('wake_model', wake_model)
+            max_distance_m = wake_candidates.criteria.get('max_distance_m', max_distance_m)
+
         start_half_width = 0.0 if rotor_diameter_m is None else rotor_diameter_m / 2
 
         crs = self.plotting_crs if crs is None else crs
@@ -2433,7 +2442,7 @@ class CWEX:
             ax.add_artist(ScaleBar(1, location='lower right'))
 
         if title is None:
-            title = f'Wind from {direction:g}° — wakes from {", ".join(turbines) if len(turbines) <= 4 else "all turbines"}'
+            title = f'Wind from {direction:g}°'
         ax.set_title(title)
 
         return (ax.figure, ax) if return_fig else ax
